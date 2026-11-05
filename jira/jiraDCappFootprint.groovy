@@ -890,7 +890,7 @@ class Fp {
     /* ---- workflow modules: registered, enabled, and what their class says ---- */
 
     static boolean isAppClassName(String className) {
-        return !className.startsWith("java.") && !className.startsWith("groovy.")
+        return className != null && !className.startsWith("java.") && !className.startsWith("groovy.")
     }
 
     /*
@@ -951,7 +951,7 @@ class Fp {
                 String moduleKey = descriptor.getKey()
                 String completeKey = descriptor.getCompleteKey()
                 String moduleClass = readModuleClass(descriptor, completeKey, hidden.diagnostics)
-                if (moduleClass != null && isAppClassName(moduleClass)) {
+                if (isAppClassName(moduleClass)) {
                     moduleClassOwners.putIfAbsent(moduleClass, pluginKey)
                 }
                 if (isWorkflowModule(descriptor)) {
@@ -1060,11 +1060,11 @@ class Fp {
         }
         String owner = extension.ownerPluginKey
         if (owner == null) {
-            boolean gapPossible = extension.className != null &&
-                !(contenders.isEmpty() && disabledGaps.isEmpty())
-            openPosition(extension, gapPossible ? OPEN_CLASS_CATALOG_INCOMPLETE : OPEN_NOT_PROVEN,
-                gapPossible ? contenders : Collections.<String>emptySet(),
-                gapPossible ? disabledGaps : Collections.<String>emptySet())
+            if (extension.className != null && !(contenders.isEmpty() && disabledGaps.isEmpty())) {
+                openPosition(extension, OPEN_CLASS_CATALOG_INCOMPLETE, contenders, disabledGaps)
+            } else {
+                openPosition(extension, OPEN_NOT_PROVEN, Collections.<String>emptySet(), Collections.<String>emptySet())
+            }
             return
         }
         Set<String> candidates = new TreeSet<String>(contenders)
@@ -1111,7 +1111,6 @@ class Fp {
 
     static List<Map<String, Object>> groupOpenPositions(Collection<WorkflowExtension> extensions) {
         Map<String, Map<String, Object>> groups = new TreeMap<String, Map<String, Object>>()
-        Map<String, Set<String>> workflows = new HashMap<String, Set<String>>()
         for (WorkflowExtension extension : extensions) {
             if (extension.openReason == null) {
                 continue
@@ -1122,19 +1121,17 @@ class Fp {
             Map<String, Object> group = groups.get(key)
             if (group == null) {
                 group = [evidence: evidence, reason: extension.openReason, positions: 0,
-                         kinds: new TreeSet<String>(), workflows: 0,
+                         kinds: new TreeSet<String>(), workflows: new TreeSet<String>(),
                          candidates: extension.openCandidates,
                          disabledCandidates: extension.openDisabledCandidates,
                          examples: new ArrayList<String>(), examplesTruncated: false] as LinkedHashMap
                 groups.put(key, group)
-                workflows.put(key, new TreeSet<String>())
             }
             group.positions = ((int) group.positions) + 1
             if (extension.kind != null) {
                 ((Set<String>) group.kinds).add(extension.kind)
             }
-            workflows.get(key).add(nullSafe(extension.workflowName))
-            group.workflows = workflows.get(key).size()
+            ((Set<String>) group.workflows).add(nullSafe(extension.workflowName))
             List<String> examples = (List<String>) group.examples
             if (examples.size() < OPEN_POSITION_EXAMPLES) {
                 examples.add(nullSafe(extension.workflowName) + " / " +
@@ -1147,6 +1144,7 @@ class Fp {
         List<Map<String, Object>> result = new ArrayList<Map<String, Object>>()
         for (Map<String, Object> group : groups.values()) {
             group.kinds = new ArrayList<String>((Set<String>) group.kinds)
+            group.workflows = ((Set<String>) group.workflows).size()
             result.add(group)
         }
         /* a row an app could be behind comes first, whatever the alphabet says */
@@ -1596,13 +1594,6 @@ class Fp {
     }
 
     /*
-     * Ordering, computed once ownership is known. "Followed by other" counts the
-     * entries behind this one in the SAME chain that a different owner provides,
-     * native Jira functions included - that is the dependency a migration off
-     * Data Center has to reason about. Entries from separate conditional
-     * branches never share a chain, so they are never compared.
-     */
-    /*
      * Only a proven foreign owner makes a dependency. An entry of unknown owner may be the
      * app's own, so it proves nothing either way: the answer stays open rather than yes,
      * and a proven one settles it however many others stay unknown. Same terms as Scalpel.
@@ -1612,6 +1603,13 @@ class Fp {
     static final String ORDERING_UNKNOWN = "UNKNOWN"
     static final String ORDERING_NOT_APPLICABLE = "NOT_APPLICABLE"
 
+    /*
+     * Ordering, computed once ownership is known. "Followed by other" counts the
+     * entries behind this one in the SAME chain that a different owner provides,
+     * native Jira functions included - that is the dependency a migration off
+     * Data Center has to reason about. Entries from separate conditional
+     * branches never share a chain, so they are never compared.
+     */
     static void markOrdering(List<WorkflowExtension> extensions) {
         if (extensions == null || extensions.isEmpty()) {
             return
@@ -4529,7 +4527,7 @@ appFootprint(
             module.enabled = Fp.readModuleEnablement(pluginAccessor, module.completeKey, app.diagnostics)
 
             module.moduleClass = Fp.readModuleClass(descriptor, module.completeKey, app.diagnostics)
-            if (module.moduleClass != null && Fp.isAppClassName(module.moduleClass)) {
+            if (Fp.isAppClassName(module.moduleClass)) {
                 moduleClasses.add(module.moduleClass)
                 moduleClassOwners.putIfAbsent(module.moduleClass, app.pluginKey)
             }
@@ -4553,7 +4551,7 @@ appFootprint(
             if (workflowRead != null) {
                 allWorkflowModuleReads.add(workflowRead)
                 app.recordWorkflowModule(workflowRead)
-                if (workflowRead.className != null && Fp.isAppClassName(workflowRead.className)) {
+                if (Fp.isAppClassName(workflowRead.className)) {
                     moduleClasses.add(workflowRead.className)
                 }
             }
