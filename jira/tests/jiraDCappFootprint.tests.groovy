@@ -1680,8 +1680,9 @@ check("a native function has no module key arg", walked[0].fullModuleKey, null)
 walked.each { WorkflowExtension e ->
     e.workflowName = "Acme Workflow"
     String owner = Fp.fullModuleOwner(e.fullModuleKey, ["com.acme.app"])
-    e.ownerPluginKey = owner
-    e.attribution = owner == null ? null : Fp.BY_MODULE_KEY
+    /* the class index covers every plugin, so a native function's owner is read like any other */
+    e.ownerPluginKey = owner ?: "com.atlassian.jira.plugin.system.workflow"
+    e.attribution = owner == null ? Fp.BY_MODULE_CLASS : Fp.BY_MODULE_KEY
 }
 Fp.markOrdering(walked)
 
@@ -1857,7 +1858,7 @@ check("and the module key survives the separatorless split",
     srPostFunction.moduleKey,
     "scriptrunner-workflow-function-com.onresolve.scriptrunner.canned.jira.workflow.postfunctions.AddWatcher")
 
-/* a native entry stays unattributed, which is what makes it count as foreign */
+/* a native entry whose owner is in no index stays unattributed */
 WorkflowExtension nativeFunction = new WorkflowExtension(
     kind: Fp.KIND_POST_FUNCTION,
     className: "com.atlassian.jira.workflow.function.issue.UpdateIssueStatusFunction")
@@ -2223,6 +2224,59 @@ class Op1602ConditionA { }
 class Op1602ConditionB { }
 class Op1602ConditionC { }
 
+class FakeCensusModule extends FakeWorkflowModule {
+    String key
+    String completeKey
+    Class moduleClass
+    Class getModuleClass() { return moduleClass }
+}
+
+class FakeCensusWebModule {
+    String key
+    String completeKey
+    Class moduleClass
+    Throwable keyFailure
+    Throwable moduleClassFailure
+    String getKey() {
+        if (keyFailure != null) {
+            throw keyFailure
+        }
+        return key
+    }
+    Class getModuleClass() {
+        if (moduleClassFailure != null) {
+            throw moduleClassFailure
+        }
+        return moduleClass
+    }
+}
+
+class FakeCensusPlugin {
+    String key
+    String name
+    List descriptors = []
+    Throwable failure
+    List getModuleDescriptors() {
+        if (failure != null) {
+            throw failure
+        }
+        return descriptors
+    }
+}
+
+class FakeStates {
+    Map<String, Object> states = [:]
+    List<String> reads = []
+    boolean isPluginModuleEnabled(String completeKey) {
+        reads.add(completeKey)
+        Object state = states.get(completeKey)
+        if (state instanceof Throwable) {
+            throw (Throwable) state
+        }
+        return (boolean) state
+    }
+}
+
 /* A closure of its own: the script body already sits close to the JVM's 64 KB method limit. */
 def op1602Section = {
 
@@ -2351,9 +2405,6 @@ ok("the endpoint reads the workflow module through the classifier",
     endpointText.contains('Fp.readWorkflowModule(descriptor, app.pluginKey, module.key,'))
 ok("the endpoint reads the enablement through the shared helper",
     endpointText.contains('Fp.readModuleEnablement(pluginAccessor, module.completeKey, app.diagnostics)'))
-/* getModuleClass feeds the class index and the text scan, so its failure limits both */
-ok("a failed getModuleClass read reaches the diagnostics",
-    (endpointText =~ /Class<\?> moduleClazz = descriptor\.getModuleClass\(\)[\s\S]{0,600}catch \(Throwable error\) \{\s*module\.moduleClass = null\s*Fp\.note\(app\.diagnostics, "module class "/).find())
 
 List disabledWithClassReads = []
 AppFootprint disabledWithClassApp = newApp("com.acme.disabled-class")
@@ -2746,21 +2797,22 @@ ok("the existing CSV header is still intact up to its last old column",
 ok("the existing CSV header is extended at its end",
     endpointText.contains(legacyCsvTail + ',${Fp.WORKFLOW_CSV_COLUMNS}\\n")'))
 ok("the existing CSV row is extended at its end",
-    (endpointText =~ /csv\.append\(app\.diagnosticCount\)\.append\(","\)\s*csv\.append\(Fp\.workflowCsvCells\(app, openPositionGroups\)\)\.append\("\\n"\)/).find())
+    (endpointText =~ /csv\.append\(app\.diagnosticCount\)\.append\(","\)\s*csv\.append\(Fp\.workflowCsvCells\(app, openPositionGroups, hiddenApps, extensionPointsOfHiddenApps\)\)\.append\("\\n"\)/).find())
 t("the CSV header names the new columns", { Fp.WORKFLOW_CSV_COLUMNS },
     "workflowModulesEnabled,workflowModulesDisabled,workflowModulesUnknown,workflowModuleDiagnostics," +
-    "openWorkflowPositions,unattributedExtensionPoints,unattributedExtensionPointReasons")
+    "openWorkflowPositions,unattributedExtensionPoints,unattributedExtensionPointReasons," +
+    "extensionPointsOfHiddenApps,hiddenWorkflowModuleDiagnostics,orderingUnknown")
 t("the CSV cells carry the counts and the diagnostics", {
-    Fp.workflowCsvCells(measuredApp, Fp.groupOpenPositions(orphans))
-}, '3,1,0,"com.acme.app:condition-d DISABLED_MODULE_CLASS_UNAVAILABLE",0,2,"WORKFLOW_CLASS_CATALOG_INCOMPLETE=2"')
+    Fp.workflowCsvCells(measuredApp, Fp.groupOpenPositions(orphans), [], 5)
+}, '3,1,0,"com.acme.app:condition-d DISABLED_MODULE_CLASS_UNAVAILABLE",0,2,"WORKFLOW_CLASS_CATALOG_INCOMPLETE=2",5,"",0')
 t("the CSV cells match the header in number", {
     Fp.WORKFLOW_CSV_COLUMNS.split(",").size()
-}, 7)
+}, 10)
 
 ok("the JSON summary carries the open position count",
     endpointText.contains('unattributedExtensionPoints: unattributedExtensionPoints,'))
 ok("the JSON report lists the open positions",
-    endpointText.contains('workflowAttribution: Fp.workflowAttributionMap(apps, openPositionGroups, workflowExtensionWalkComplete)'))
+    endpointText.contains('workflowAttribution: Fp.workflowAttributionMap(attributionApps, openPositionGroups, workflowExtensionWalkComplete)'))
 t("the JSON attribution block carries both lists", {
     Map block = Fp.workflowAttributionMap([measuredApp], Fp.groupOpenPositions(orphans), true)
     block.unattributedExtensionPoints == 2 && block.complete == true &&
@@ -2780,13 +2832,287 @@ t("a row an app could be behind sorts before one it cannot", {
     Fp.groupOpenPositions([plain, possible]).collect { it.evidence }
 }, ["z.Unread", "a.Native"])
 t("an incomplete walk marks the CSV total as a lower bound", {
-    Fp.workflowCsvCells(walkFailureApp, []).endsWith('"WORKFLOW_WALK_INCOMPLETE"')
+    Fp.workflowCsvCells(walkFailureApp, [], [], 0).contains('"WORKFLOW_WALK_INCOMPLETE"')
 }, true)
 ok("the report renders the attribution section",
-    endpointText.contains('Fp.workflowAttributionHtml(apps, openPositionGroups, workflowExtensionWalkComplete, numberLocale)'))
+    endpointText.contains('Fp.workflowAttributionHtml(attributionApps, openPositionGroups, workflowExtensionWalkComplete, numberLocale)'))
 ok("the instance summary counts the unknown verdicts apart",
     endpointText.contains('workflowCapabilityUnknownApps: totalUnknownWorkflowApps') &&
     endpointText.contains('workflowCapabilityDisabledOnlyApps: totalDisabledOnlyWorkflowApps'))
+
+/* -- the owner index covers every plugin, the report filters only list apps ----- */
+
+/*
+ * Measured on Jira 11.3.12: with includeSystem=false, 274 positions read as having no
+ * proven owner, with includeSystem=true none did. Their owner exists. The filter had
+ * only kept it out of the class index.
+ */
+def op1602Census = {
+
+def censusRead = { FakeCensusPlugin plugin, FakeStates states, List reads, Map owners, Set unread, List censusSink ->
+    return soft("census " + plugin.key) {
+        Fp.readHiddenPlugin(plugin, states, owners, reads, unread, censusSink)
+    }
+}
+def module = { String plugin, String key, Class impl, Throwable failure = null, Class moduleClass = null ->
+    new FakeCensusModule(key: key, completeKey: plugin + ":" + key, impl: impl, failure: failure,
+        moduleClass: moduleClass)
+}
+
+List ownerReads = []
+Map ownerClasses = [:]
+Set ownerUnread = new HashSet()
+List<String> ownerSink = []
+AppFootprint visibleApp = newApp("com.acme.visible")
+register(visibleApp, ownerReads, "condition", Boolean.TRUE, Op1602ConditionA)
+FakeStates systemStates = new FakeStates(states: ["com.atlassian.system:permission": Boolean.TRUE])
+FakeCensusModule systemWorkflowModule = module("com.atlassian.system", "permission", Op1602ConditionB)
+FakeCensusWebModule systemWebModule = new FakeCensusWebModule(key: "web",
+    completeKey: "com.atlassian.system:web", moduleClass: Op1602ConditionC)
+Object systemHolder = censusRead(new FakeCensusPlugin(key: "com.atlassian.system", name: "System",
+    descriptors: [systemWorkflowModule, systemWebModule]), systemStates, ownerReads, ownerClasses,
+    ownerUnread, ownerSink)
+WorkflowExtension ownerHidden = classOnly(Op1602ConditionB)
+WorkflowExtension ownerHiddenByModuleClass = classOnly(Op1602ConditionC)
+WorkflowExtension ownerVisible = classOnly(Op1602ConditionA)
+WorkflowExtension ownerNowhere = new WorkflowExtension(kind: Fp.KIND_CONDITION, className: "com.acme.nowhere.Thing")
+List<WorkflowExtension> ownerPositions = [ownerHidden, ownerHiddenByModuleClass, ownerVisible, ownerNowhere]
+scan([visibleApp], ownerReads, ownerPositions, ownerClasses, ownerUnread)
+
+t("a filter hides the owner: the position still has one",
+    { ownerHidden.ownerPluginKey }, "com.atlassian.system")
+t("it is not open", { ownerHidden.openReason }, null)
+t("the weaker module class index covers hidden plugins too",
+    { ownerHiddenByModuleClass.ownerPluginKey }, "com.atlassian.system")
+t("the visible app keeps its own position only", { visibleApp.extensionPointCount }, 1)
+t("and its verdict stays settled", { visibleApp.workflowCapability }, "In use")
+t("a position of a hidden app is counted as such",
+    { Fp.hiddenOwnerPositions(ownerPositions, [visibleApp]) }, 2)
+t("a key match to a hidden app counts as well", {
+    Fp.hiddenOwnerPositions([new WorkflowExtension(ownerPluginKey: "com.atlassian.system",
+        attribution: Fp.BY_MODULE_KEY)], [visibleApp])
+}, 1)
+t("a class in no plugin stays unattributed", { ownerNowhere.openReason }, "OWNER_NOT_PROVEN")
+t("and it is the only one that does",
+    { Fp.openPositionTotal(Fp.groupOpenPositions(ownerPositions)) }, 1)
+t("every position lands in exactly one bucket", {
+    visibleApp.extensionPointCount + Fp.hiddenOwnerPositions(ownerPositions, [visibleApp]) +
+        Fp.openPositionTotal(Fp.groupOpenPositions(ownerPositions))
+}, ownerPositions.size())
+t("listing the owner moves the position over, nothing else", {
+    Fp.hiddenOwnerPositions(ownerPositions, [visibleApp, new AppFootprint(pluginKey: "com.atlassian.system")])
+}, 0)
+t("a clean hidden plugin adds no diagnostic", { ownerSink }, [])
+t("the holder says it is not listed", { systemHolder.hiddenByFilter }, true)
+t("the census reads enablement only where the class needs it",
+    { systemStates.reads }, ["com.atlassian.system:permission"])
+t("and the workflow class exactly once", { systemWorkflowModule.reads }, 1)
+t("a hidden module is named when it is the only candidate for naming", {
+    WorkflowExtension named = classOnly(Op1602ConditionB)
+    named.identity.add("com.acme.canned.HiddenThing")
+    List hiddenNamedReads = []
+    soft("named") {
+        Fp.readHiddenPlugin(new FakeCensusPlugin(key: "com.acme.hidden", name: "Hidden", descriptors: [
+            module("com.acme.hidden", "prefix-com.acme.canned.HiddenThing", Op1602ConditionB)]),
+            new FakeStates(states: ["com.acme.hidden:prefix-com.acme.canned.HiddenThing": Boolean.TRUE]),
+            [:], hiddenNamedReads, new HashSet(), [])
+    }
+    Fp.attributeExtensions([named], [], [:], hiddenNamedReads, new HashSet())
+    named.moduleKey
+}, "prefix-com.acme.canned.HiddenThing")
+
+/* The first index entry stays with a listed app, because it is read first. */
+t("a module class of a listed app keeps the fallback entry", {
+    Map fallback = [(Op1602ConditionC.getName()): "com.acme.visible"]
+    Fp.readHiddenPlugin(new FakeCensusPlugin(key: "com.atlassian.system", name: "System",
+        descriptors: [systemWebModule]), systemStates, fallback, [], new HashSet(), [])
+    fallback[Op1602ConditionC.getName()]
+}, "com.acme.visible")
+
+/* -- hidden apps compete under the same rules, and their gaps stay visible ------- */
+
+List disabledHiddenReads = []
+List<String> disabledHiddenSink = []
+AppFootprint disabledHiddenOwner = newApp("com.acme.owner")
+register(disabledHiddenOwner, disabledHiddenReads, "condition", Boolean.TRUE, Op1602ConditionA)
+Object disabledHidden = censusRead(new FakeCensusPlugin(key: "com.acme.hidden", name: "Hidden",
+    descriptors: [module("com.acme.hidden", "condition", null)]),
+    new FakeStates(states: ["com.acme.hidden:condition": Boolean.FALSE]),
+    disabledHiddenReads, [:], new HashSet(), disabledHiddenSink)
+WorkflowExtension disabledHiddenPosition = classOnly(Op1602ConditionA)
+scan([disabledHiddenOwner], disabledHiddenReads, [disabledHiddenPosition])
+t("a hidden disabled module does not compete",
+    { disabledHiddenPosition.ownerPluginKey }, "com.acme.owner")
+t("and raises no read error", { disabledHiddenSink }, [])
+t("its note stays visible, marked as not listed", {
+    Fp.workflowAttributionMap([disabledHiddenOwner, disabledHidden], [], true).moduleDiagnostics.collect {
+        it.module + " " + it.code + " " + it.hidden }
+}, ["com.acme.hidden:condition DISABLED_MODULE_CLASS_UNAVAILABLE true"])
+t("the section says so", {
+    Fp.workflowAttributionHtml([disabledHiddenOwner, disabledHidden], [], true, Locale.ENGLISH)
+        .contains("not listed by the current filters")
+}, true)
+
+List enabledHiddenReads = []
+List<String> enabledHiddenSink = []
+AppFootprint enabledHiddenOwner = newApp("com.acme.owner")
+register(enabledHiddenOwner, enabledHiddenReads, "condition", Boolean.TRUE, Op1602ConditionA)
+Object enabledHidden = censusRead(new FakeCensusPlugin(key: "com.acme.hidden", name: "Hidden",
+    descriptors: [module("com.acme.hidden", "condition", null)]),
+    new FakeStates(states: ["com.acme.hidden:condition": Boolean.TRUE]),
+    enabledHiddenReads, [:], new HashSet(), enabledHiddenSink)
+WorkflowExtension enabledHiddenPosition = classOnly(Op1602ConditionA)
+scan([enabledHiddenOwner], enabledHiddenReads, [enabledHiddenPosition])
+t("a hidden enabled module without a class competes",
+    { enabledHiddenPosition.openCandidates }, ["com.acme.hidden", "com.acme.owner"])
+t("and leaves the listed app's verdict open",
+    { enabledHiddenOwner.workflowCapability }, "Unknown")
+t("its gap reaches the report-wide diagnostics", {
+    enabledHiddenSink.size() == 1 && enabledHiddenSink[0].contains("ENABLED_MODULE_CLASS_UNAVAILABLE") &&
+        enabledHiddenSink[0].contains("com.acme.hidden:condition")
+}, true)
+
+List throwingHiddenReads = []
+List<String> throwingHiddenSink = []
+AppFootprint throwingHiddenOwner = newApp("com.acme.owner")
+register(throwingHiddenOwner, throwingHiddenReads, "condition", Boolean.TRUE, Op1602ConditionA)
+censusRead(new FakeCensusPlugin(key: "com.acme.hidden", name: "Hidden", descriptors: [
+    module("com.acme.hidden", "condition", null, new IllegalStateException("broken lookup"))]),
+    new FakeStates(states: ["com.acme.hidden:condition": Boolean.FALSE]),
+    throwingHiddenReads, [:], new HashSet(), throwingHiddenSink)
+WorkflowExtension throwingHiddenPosition = classOnly(Op1602ConditionA)
+scan([throwingHiddenOwner], throwingHiddenReads, [throwingHiddenPosition])
+t("a failed read in a hidden app competes, also when disabled",
+    { throwingHiddenPosition.ownerPluginKey }, null)
+t("and it is a reported read error", {
+    throwingHiddenSink.size() == 1 && throwingHiddenSink[0].contains("MODULE_IMPLEMENTATION_READ_FAILED")
+}, true)
+
+FakeStates brokenStates = new FakeStates(states: ["com.acme.hidden:condition": new IllegalArgumentException("gone")])
+List<String> brokenStateSink = []
+List brokenStateReads = []
+censusRead(new FakeCensusPlugin(key: "com.acme.hidden", name: "Hidden", descriptors: [
+    module("com.acme.hidden", "condition", Op1602ConditionB)]), brokenStates, brokenStateReads, [:],
+    new HashSet(), brokenStateSink)
+t("an unreadable enablement in a hidden app is noted",
+    { brokenStateSink.size() == 1 && brokenStateSink[0].contains("com.acme.hidden:condition") }, true)
+t("and its class still proves the owner", { brokenStateReads[0].className }, Op1602ConditionB.getName())
+
+List listHiddenReads = []
+Set listHiddenUnread = new HashSet()
+List<String> listHiddenSink = []
+AppFootprint listHiddenOwner = newApp("com.acme.owner")
+register(listHiddenOwner, listHiddenReads, "condition", Boolean.TRUE, Op1602ConditionA)
+censusRead(new FakeCensusPlugin(key: "com.acme.hidden", name: "Hidden",
+    failure: new IllegalStateException("no list")), new FakeStates(), listHiddenReads, [:],
+    listHiddenUnread, listHiddenSink)
+WorkflowExtension listHiddenPosition = classOnly(Op1602ConditionA)
+scan([listHiddenOwner], listHiddenReads, [listHiddenPosition], [:], listHiddenUnread)
+t("an unreadable module list of a hidden app competes",
+    { listHiddenPosition.openCandidates }, ["com.acme.hidden", "com.acme.owner"])
+t("and is reported", { listHiddenSink.size() == 1 && listHiddenSink[0].contains("com.acme.hidden") }, true)
+
+/* The census reads plugins this report never touched before, so it must not be able to end it. */
+List<String> brokenDescriptorSink = []
+Set brokenDescriptorUnread = new HashSet()
+List brokenDescriptorReads = []
+censusRead(new FakeCensusPlugin(key: "com.acme.broken", name: "Broken", descriptors: [
+    new FakeCensusWebModule(keyFailure: new NoClassDefFoundError("gone"))]),
+    new FakeStates(), brokenDescriptorReads, [:], brokenDescriptorUnread, brokenDescriptorSink)
+t("a descriptor that cannot even name itself leaves the list unread", {
+    brokenDescriptorUnread.contains("com.acme.broken") && brokenDescriptorSink.size() == 1
+}, true)
+
+t("a failed module class read is a diagnostic, not a null", {
+    List<String> failSink = []
+    Object value = Fp.readModuleClass(new FakeCensusWebModule(moduleClassFailure:
+        new IllegalStateException("boom")), "p:m", failSink)
+    value == null && failSink.size() == 1 && failSink[0].startsWith("module class p:m") && failSink[0].contains("boom")
+}, true)
+t("a read module class is returned by name", {
+    Fp.readModuleClass(new FakeCensusWebModule(moduleClass: Op1602ConditionC), "p:m", [])
+}, Op1602ConditionC.getName())
+
+ok("the endpoint reads hidden plugins inside the plugin key catalog",
+    (endpointText =~ /for \(Plugin plugin : pluginAccessor\.getPlugins\(\)\) \{[\s\S]{0,500}Fp\.readHiddenPlugin\(plugin, pluginAccessor, moduleClassOwners,\s*allWorkflowModuleReads, unreadModuleLists, globalDiagnostics\)/).find())
+ok("the endpoint reads the module class through the shared helper",
+    endpointText.contains('Fp.readModuleClass(descriptor, module.completeKey, app.diagnostics)'))
+ok("the summary carries the positions of hidden apps",
+    endpointText.contains('extensionPointsOfHiddenApps: extensionPointsOfHiddenApps,'))
+ok("the HTML names them",
+    endpointText.contains('Extension Points of Hidden Apps'))
+ok("the census time is measured",
+    endpointText.contains('pluginCensusMs: pluginCensusMs'))
+ok("hidden gaps reach the report-wide block",
+    endpointText.contains('Fp.workflowAttributionHtml(attributionApps, openPositionGroups, workflowExtensionWalkComplete, numberLocale)') &&
+    endpointText.contains('workflowAttribution: Fp.workflowAttributionMap(attributionApps, openPositionGroups, workflowExtensionWalkComplete)'))
+
+/* -- ordering: an unknown owner behind a post function proves nothing ------------- */
+
+def chainOf = { List<String> owners ->
+    int position = 0
+    owners.collect { String owner -> new WorkflowExtension(kind: Fp.KIND_POST_FUNCTION, workflowName: "WF",
+        scope: "Transition", transitionId: 1, chain: "post", position: ++position,
+        chainLength: owners.size(), ownerPluginKey: owner) }
+}
+def statusOf = { WorkflowExtension extension -> extension.orderingStatus }
+
+List<WorkflowExtension> unknownBehind = chainOf(["com.acme.app", null])
+Fp.markOrdering(unknownBehind)
+t("an unknown owner behind a post function is not a proven foreign owner",
+    { unknownBehind[0].followedByOther }, 0)
+t("it stays counted as running behind", { unknownBehind[0].followedBy }, 1)
+t("and is counted as unknown", { unknownBehind[0].followedByUnknown }, 1)
+t("so it claims no ordering dependency", { unknownBehind[0].orderingRisk }, false)
+t("and the status says it is open", { statusOf(unknownBehind[0]) }, "UNKNOWN")
+
+List<WorkflowExtension> foreignAndUnknown = chainOf(["com.acme.app", null, "com.acme.other"])
+Fp.markOrdering(foreignAndUnknown)
+t("a proven foreign owner settles it, whatever else is unknown",
+    { foreignAndUnknown[0].orderingRisk }, true)
+t("with only the proven one counted as foreign", { foreignAndUnknown[0].followedByOther }, 1)
+t("and the unknown one apart", { foreignAndUnknown[0].followedByUnknown }, 1)
+t("the status is yes", { statusOf(foreignAndUnknown[0]) }, "YES")
+
+List<WorkflowExtension> sameOwner = chainOf(["com.acme.app", "com.acme.app"])
+Fp.markOrdering(sameOwner)
+t("the app's own function behind it is no dependency", { statusOf(sameOwner[0]) }, "NO")
+List<WorkflowExtension> ownUnknown = chainOf([null, "com.acme.app"])
+Fp.markOrdering(ownUnknown)
+t("an unknown owner has no proven foreign follower either", { ownUnknown[0].followedByOther }, 0)
+WorkflowExtension conditionEntry = new WorkflowExtension(kind: Fp.KIND_CONDITION, workflowName: "WF", chain: "c")
+Fp.markOrdering([conditionEntry])
+t("the question does not arise for a condition", { statusOf(conditionEntry) }, "NOT_APPLICABLE")
+
+ok("red before green: the old rule claims a dependency from an unknown owner", {
+    List<WorkflowExtension> chain = chainOf(["com.acme.app", null])
+    String otherOwner = chain[1].ownerPluginKey
+    otherOwner == null || otherOwner != chain[0].ownerPluginKey
+}.call())
+
+List orderingReads = []
+AppFootprint orderingApp = newApp("com.acme.app")
+register(orderingApp, orderingReads, "function", Boolean.TRUE, Op1602ConditionA)
+orderingApp.workflowExtensions.addAll(unknownBehind.subList(0, 1))
+orderingApp.finish()
+t("the app counts the open question", { orderingApp.orderingUnknownCount }, 1)
+t("not as a dependency", { orderingApp.orderingRiskCount }, 0)
+t("the JSON carries it", { orderingApp.asMap(false).footprint.orderingUnknown }, 1)
+t("position by position too",
+    { orderingApp.asMap(false).footprint.workflowExtensions[0].followedByUnknown }, 1)
+t("and with its status",
+    { orderingApp.asMap(false).footprint.workflowExtensions[0].orderingStatus }, "UNKNOWN")
+ok("the summary carries the open ordering count",
+    endpointText.contains('orderingUnknown: totalOrderingUnknown,'))
+ok("the card marks a zero that an unknown follower could change",
+    endpointText.contains('Fp.orderingCell(app, numberLocale)'))
+t("that mark is a lower bound on the count", {
+    Fp.orderingCell(orderingApp, Locale.ENGLISH).contains("&#42;") &&
+        Fp.orderingCell(orderingApp, Locale.ENGLISH).startsWith("0")
+}, true)
+
+}
+op1602Census.call()
 
 ok("no fixture step failed: " + op1602SetupFailures, op1602SetupFailures.isEmpty())
 
