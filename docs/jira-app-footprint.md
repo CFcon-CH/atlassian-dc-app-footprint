@@ -36,7 +36,9 @@ Example: `?includeArchived=true&format=csv`. The **Archived** button enables a s
 
 ## Read the result
 
-**Key figures** and the app cards distinguish installed modules, app-provided custom fields, work items with field values, screen placements, workflow references, workflow extension points, and reached projects/work items. A workflow **reference** is a text occurrence in a persisted workflow descriptor. An **extension point** is a configured post function, condition, validator, or pre function on a specific transition, including position. A dormant workflow module is capability installed but not configured.
+**Key figures** and the app cards distinguish installed modules, app-provided custom fields, work items with field values, screen placements, workflow references, workflow extension points, and reached projects/work items. A workflow **reference** is a text occurrence in a persisted workflow descriptor. An **extension point** is a configured post function, condition, validator, or pre function on a specific transition, including position. A dormant workflow module is capability installed but not configured. **Disabled modules only** means every workflow module of the app is proven disabled, and **Unknown** means an unreadable fact could change the verdict. A disabled module is an expected observation, not a read error; it stays counted in `workflowModules` beside the enabled and unknown counts.
+
+The **Workflow attribution** block names each workflow module the report could not fully read, with its reason, and lists workflow positions without an owner by class. Those positions are in no app's numbers. Jira's own functions land there on any instance, so read the reason and possible owners rather than the total: a row naming an app is the one to investigate.
 
 The field count “Issues With Value” comes from Jira's custom-field count and can be a refreshed snapshot. With archived measurement enabled, the current/archive split combines that total with live archived reads, so the split may drift and needs review when defaults are involved. A screen or workflow reach count describes configuration reach, not observed user activity.
 
@@ -44,7 +46,7 @@ Impact is the highest measured share of relevant instance denominators: **CRITIC
 
 An asterisk marks a partial lower bound. `n/m` means not measured, and `err` means a failed measurement; neither is zero. Read each app's diagnostics and the options line before quoting counts. An archived scan that was skipped or partial cannot establish no archived dependency.
 
-JSON includes report/instance/options, summary, app details, impact dimensions, and diagnostics. CSV is comma-separated with one row per app; it includes identity, impact, modules, field associations, workflow and extension counts, reach states, and diagnostics. The impact-dimensions cell is structured JSON inside CSV. Save the options and timestamp with either export.
+JSON includes report/instance/options, summary, app details, impact dimensions, diagnostics, and `workflowAttribution`. CSV is comma-separated with one row per app; it includes identity, impact, modules, field associations, workflow and extension counts, reach states, and diagnostics, then the workflow module counts and notes and the instance's unattributed position total and reasons as its last columns. The impact-dimensions cell is structured JSON inside CSV. Save the options and timestamp with either export.
 
 ## Optional Confluence page export
 
@@ -55,7 +57,7 @@ Press **Export to Confluence**. Choose a configured Confluence application link,
 - **403:** use a member of `jira-administrators` and check the endpoint group gate.
 - **Slow or partial result:** inspect `issueBudgetMs` and measurement notes. Rerun with a larger budget during an appropriate window only if full counts are needed.
 - **No count or no footprint:** distinguish off, `n/m`, `err`, partial, and measured zero before drawing a conclusion.
-- **Unexpected workflow attribution:** inspect descriptor/module class evidence and diagnostics. A text reference is not the same as an extension point.
+- **Unexpected workflow attribution:** inspect descriptor/module class evidence, diagnostics and the **Workflow attribution** block. A text reference is not the same as an extension point. A disabled module has no readable class, so a class-only reference to it stays unattributed.
 - **Export refused:** check application link, target permissions, selected space/page, and page marker. Do not bypass a failed Decision read.
 
 Reports can contain app inventory, configuration links, project keys, and counts. Handle downloads and exported pages as administrator data.

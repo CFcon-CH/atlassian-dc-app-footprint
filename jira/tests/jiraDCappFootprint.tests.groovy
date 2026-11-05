@@ -2041,13 +2041,13 @@ ok("nothing does not", !Fp.couldNameAModule(null))
  * switch it on the day after the assessment was signed off.
  */
 check("an app with no workflow module has no capability to report",
-    Fp.workflowCapability(0, 0), Fp.CAPABILITY_NONE)
+    Fp.workflowCapability(0, 0, 0, false, false, 0), Fp.CAPABILITY_NONE)
 check("modules registered and nothing configured is dormant, not absent",
-    Fp.workflowCapability(12, 0), Fp.CAPABILITY_DORMANT)
+    Fp.workflowCapability(12, 0, 0, false, false, 0), Fp.CAPABILITY_DORMANT)
 check("one configured extension point makes it in use",
-    Fp.workflowCapability(12, 1), Fp.CAPABILITY_IN_USE)
+    Fp.workflowCapability(12, 0, 0, false, false, 1), Fp.CAPABILITY_IN_USE)
 check("a single module is enough to be dormant",
-    Fp.workflowCapability(1, 0), Fp.CAPABILITY_DORMANT)
+    Fp.workflowCapability(1, 0, 0, false, false, 0), Fp.CAPABILITY_DORMANT)
 
 /*
  * Configured entries win over the module count, even where the count is zero.
@@ -2057,7 +2057,7 @@ check("a single module is enough to be dormant",
  * worse answer than the inconsistency itself.
  */
 check("a measured extension point is never overruled by a missing module list",
-    Fp.workflowCapability(0, 3), Fp.CAPABILITY_IN_USE)
+    Fp.workflowCapability(0, 0, 0, true, false, 3), Fp.CAPABILITY_IN_USE)
 
 /* the three states are distinct, which is the whole point of the change */
 ok("the three states are distinguishable",
@@ -2067,7 +2067,7 @@ ok("the three states are distinguishable",
 def emptyOrNot = { int modules, int configured -> configured > 0 ? "has" : "empty" }
 ok("the control paints an app with twelve idle modules the same as one with none",
     emptyOrNot(12, 0) == emptyOrNot(0, 0) &&
-    Fp.workflowCapability(12, 0) != Fp.workflowCapability(0, 0))
+    Fp.workflowCapability(12, 0, 0, false, false, 0) != Fp.workflowCapability(0, 0, 0, false, false, 0))
 
 /* ---- OP-1463: the measured total gets its own column ----------------------- */
 
@@ -2354,6 +2354,17 @@ ok("the endpoint reads the enablement through the shared helper",
 /* getModuleClass feeds the class index and the text scan, so its failure limits both */
 ok("a failed getModuleClass read reaches the diagnostics",
     (endpointText =~ /Class<\?> moduleClazz = descriptor\.getModuleClass\(\)[\s\S]{0,600}catch \(Throwable error\) \{\s*module\.moduleClass = null\s*Fp\.note\(app\.diagnostics, "module class "/).find())
+
+List disabledWithClassReads = []
+AppFootprint disabledWithClassApp = newApp("com.acme.disabled-class")
+Object disabledWithClass = register(disabledWithClassApp, disabledWithClassReads, "condition",
+    Boolean.FALSE, Op1602ConditionA)
+WorkflowExtension disabledWithClassPosition = classOnly(Op1602ConditionA)
+scan([disabledWithClassApp], disabledWithClassReads, [disabledWithClassPosition])
+t("a disabled module that does deliver a class has nothing to report",
+    { disabledWithClass.codes() }, [])
+t("and that class still proves the app",
+    { disabledWithClassPosition.ownerPluginKey }, "com.acme.disabled-class")
 
 /* -- enabled + null, getter throws, enablement unreadable ---------------------- */
 
@@ -2755,6 +2766,21 @@ t("the JSON attribution block carries both lists", {
     block.unattributedExtensionPoints == 2 && block.complete == true &&
         block.positions.size() == 1 && block.moduleDiagnostics.size() == 1 &&
         block.moduleDiagnostics[0].app == "com.acme.app"
+}, true)
+t("its rows hold plain lists for the JSON writer", {
+    Fp.workflowAttributionMap([measuredApp], Fp.groupOpenPositions(orphans), true)
+        .positions[0].kinds instanceof List
+}, true)
+t("a row an app could be behind sorts before one it cannot", {
+    WorkflowExtension plain = new WorkflowExtension(kind: Fp.KIND_POST_FUNCTION,
+        className: "a.Native", openReason: "OWNER_NOT_PROVEN")
+    WorkflowExtension possible = new WorkflowExtension(kind: Fp.KIND_POST_FUNCTION,
+        className: "z.Unread", openReason: "WORKFLOW_CLASS_CATALOG_INCOMPLETE",
+        openCandidates: ["com.acme.rival"])
+    Fp.groupOpenPositions([plain, possible]).collect { it.evidence }
+}, ["z.Unread", "a.Native"])
+t("an incomplete walk marks the CSV total as a lower bound", {
+    Fp.workflowCsvCells(walkFailureApp, []).endsWith('"WORKFLOW_WALK_INCOMPLETE"')
 }, true)
 ok("the report renders the attribution section",
     endpointText.contains('Fp.workflowAttributionHtml(apps, openPositionGroups, workflowExtensionWalkComplete, numberLocale)'))

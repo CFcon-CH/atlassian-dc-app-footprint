@@ -339,6 +339,10 @@ class Fp {
         if (sink == null) {
             return
         }
+        sink.add(context + " -> " + errorDetail(error))
+    }
+
+    static String errorDetail(Throwable error) {
         String detail = "unknown error"
         if (error != null) {
             detail = error.getClass().getSimpleName()
@@ -347,10 +351,7 @@ class Fp {
                 detail = detail + ": " + message.trim()
             }
         }
-        if (detail.length() > 200) {
-            detail = detail.substring(0, 200) + "..."
-        }
-        sink.add(context + " -> " + detail)
+        return detail.length() > 200 ? detail.substring(0, 200) + "..." : detail
     }
 
     /* A diagnostics list holds two different kinds of entry. A read error is a
@@ -585,17 +586,68 @@ class Fp {
      * and has none configured is the interesting middle: the capability is
      * installed and dormant, an administrator can enable it tomorrow, and no
      * usage report shows it precisely because it is not being used.
+     *
+     * Dormant needs one module proven enabled. An app whose modules are all
+     * proven disabled has its own state, because it cannot contribute anything
+     * until someone enables it, and None would say it has no modules at all.
+     * Unknown is the state of an unreadable fact that could change the verdict:
+     * a positive entry still wins, a proven enabled module survives a second
+     * module of unknown state, and neither is ever guessed the other way round.
      */
     static final String CAPABILITY_NONE = "None"
     static final String CAPABILITY_DORMANT = "Dormant"
     static final String CAPABILITY_IN_USE = "In use"
+    static final String CAPABILITY_DISABLED_ONLY = "Disabled modules only"
+    static final String CAPABILITY_UNKNOWN = "Unknown"
 
-    static String workflowCapability(int workflowModuleCount, int extensionPointCount) {
+    static String workflowCapability(int enabledModules, int disabledModules, int unknownModules,
+                                     boolean moduleListUnread, boolean usageOpen,
+                                     int extensionPointCount) {
         if (extensionPointCount > 0) {
             return CAPABILITY_IN_USE
         }
-        return workflowModuleCount > 0 ? CAPABILITY_DORMANT : CAPABILITY_NONE
+        if (enabledModules > 0) {
+            return usageOpen ? CAPABILITY_UNKNOWN : CAPABILITY_DORMANT
+        }
+        if (unknownModules > 0 || moduleListUnread) {
+            return CAPABILITY_UNKNOWN
+        }
+        return disabledModules > 0 ? CAPABILITY_DISABLED_ONLY : CAPABILITY_NONE
     }
+
+    /* The same reason codes Scalpel uses for the same observations. */
+    static final String DISABLED_MODULE_CLASS_UNAVAILABLE = "DISABLED_MODULE_CLASS_UNAVAILABLE"
+    static final String ENABLED_MODULE_CLASS_UNAVAILABLE = "ENABLED_MODULE_CLASS_UNAVAILABLE"
+    static final String MODULE_CLASS_UNAVAILABLE_ENABLEMENT_UNKNOWN = "MODULE_CLASS_UNAVAILABLE_ENABLEMENT_UNKNOWN"
+    static final String MODULE_IMPLEMENTATION_READ_FAILED = "MODULE_IMPLEMENTATION_READ_FAILED"
+    static final String MODULE_ENABLEMENT_UNAVAILABLE = "MODULE_ENABLEMENT_UNAVAILABLE"
+
+    static final String OBSERVATION = "OBSERVATION"
+    static final String INCOMPLETE = "INCOMPLETE"
+    static final String READ_ERROR = "READ_ERROR"
+
+    static final String CLASS_REFERENCES_MAY_BE_MISSING =
+        " Class-based workflow references may be incomplete."
+
+    static final Map<String, List<String>> MODULE_ISSUES = [
+        (DISABLED_MODULE_CLASS_UNAVAILABLE): [OBSERVATION,
+            "Disabled. Implementation class unavailable, as expected for a disabled module." +
+            CLASS_REFERENCES_MAY_BE_MISSING],
+        (ENABLED_MODULE_CLASS_UNAVAILABLE): [INCOMPLETE,
+            "Enabled, but no implementation class was returned." + CLASS_REFERENCES_MAY_BE_MISSING],
+        (MODULE_CLASS_UNAVAILABLE_ENABLEMENT_UNKNOWN): [INCOMPLETE,
+            "Enablement unreadable and no implementation class was returned." +
+            CLASS_REFERENCES_MAY_BE_MISSING],
+        (MODULE_IMPLEMENTATION_READ_FAILED): [READ_ERROR,
+            "The implementation class read failed." + CLASS_REFERENCES_MAY_BE_MISSING],
+        (MODULE_ENABLEMENT_UNAVAILABLE): [READ_ERROR, "The module enablement could not be read."]
+    ]
+
+    /* Why a workflow position has no owner. */
+    static final String OPEN_CLASS_CATALOG_INCOMPLETE = "WORKFLOW_CLASS_CATALOG_INCOMPLETE"
+    static final String OPEN_AMBIGUOUS = "OWNERSHIP_AMBIGUOUS"
+    static final String OPEN_NOT_PROVEN = "OWNER_NOT_PROVEN"
+    static final String WALK_INCOMPLETE = "WORKFLOW_WALK_INCOMPLETE"
 
     static final String BY_MODULE_KEY = "Module key"
     static final String BY_MODULE_CLASS = "Module class"
@@ -833,6 +885,398 @@ class Fp {
             extension.ownerPluginKey = byClass
             extension.attribution = BY_MODULE_CLASS
         }
+    }
+
+    /* ---- workflow modules: registered, enabled, and what their class says ---- */
+
+    static boolean isAppClassName(String className) {
+        return !className.startsWith("java.") && !className.startsWith("groovy.")
+    }
+
+    /*
+     * A workflow module is recognised by the method its descriptor declares, never
+     * by what that method returns. getImplementationClass() on jira-core 10.3.19 and
+     * 11.3.8 only reads a field that disabled() clears, so a null is the ordinary
+     * answer of a disabled module and proves nothing about the module existing.
+     * The meta class lookup invokes nothing, and instanceof would need a Jira type
+     * here, which would cost these helpers their offline tests.
+     */
+    static boolean isWorkflowModule(Object descriptor) {
+        Object method = descriptor.getMetaClass().getMetaMethod("getImplementationClass", new Object[0])
+        return method != null && Class.isAssignableFrom(method.getReturnType())
+    }
+
+    static Boolean readModuleEnablement(Object pluginAccessor, String completeKey, List<String> sink) {
+        try {
+            return Boolean.valueOf(pluginAccessor.isPluginModuleEnabled(completeKey))
+        } catch (Throwable error) {
+            note(sink, "module enabled flag " + completeKey, error)
+            return null
+        }
+    }
+
+    /*
+     * Reads the class exactly once, and keeps a getter that answered null apart from
+     * one that threw, which safeCall cannot. Null for anything but a workflow module.
+     */
+    static WorkflowModuleRead readWorkflowModule(Object descriptor, String pluginKey, String moduleKey,
+                                                 String completeKey, Boolean enabled) {
+        WorkflowModuleRead read = new WorkflowModuleRead(pluginKey: pluginKey, moduleKey: moduleKey,
+            completeKey: completeKey, enabled: enabled)
+        try {
+            if (!isWorkflowModule(descriptor)) {
+                return null
+            }
+            Class<?> implementation = (Class<?>) descriptor.getImplementationClass()
+            read.className = implementation == null ? null : implementation.getName()
+        } catch (Throwable error) {
+            read.failure = errorDetail(error)
+        }
+        return read
+    }
+
+    /*
+     * Key and prefix attribution stay exactly as resolveOwner decides them. What is
+     * added is the class path's honesty about its own population: a module whose class
+     * was not read may be the owner of any class-only position, so the position stays
+     * open with both named. A proven disabled module does not contest a read class,
+     * because its missing class is the expected state and says nothing against the
+     * reader. It can still be behind a class nobody read, and is named there.
+     *
+     * An open position has no owner and therefore lands in no app's numbers. It is kept
+     * on the extension so the report can count and list it.
+     */
+    static void attributeExtensions(List<WorkflowExtension> extensions, Collection<String> pluginKeys,
+                                    Map<String, String> moduleClassOwners,
+                                    Collection<WorkflowModuleRead> reads,
+                                    Collection<String> unreadModuleLists) {
+        Map<String, String> firstClassOwners = new HashMap<String, String>()
+        Map<String, Set<String>> classReaders = new HashMap<String, Set<String>>()
+        Map<String, Set<String>> keysByPlugin = new HashMap<String, Set<String>>()
+        Set<String> contenders = new TreeSet<String>(unreadModuleLists)
+        Set<String> disabledGaps = new TreeSet<String>()
+        for (WorkflowModuleRead read : reads) {
+            if (read.className != null) {
+                if (isAppClassName(read.className)) {
+                    firstClassOwners.putIfAbsent(read.className, read.pluginKey)
+                    classReaders.computeIfAbsent(read.className) { new TreeSet<String>() }.add(read.pluginKey)
+                }
+            } else if (read.competesForClass()) {
+                contenders.add(read.pluginKey)
+            } else {
+                disabledGaps.add(read.pluginKey)
+            }
+            if (read.moduleKey != null && !read.moduleKey.isEmpty()) {
+                keysByPlugin.computeIfAbsent(read.pluginKey) { new TreeSet<String>() }.add(read.moduleKey)
+            }
+        }
+        disabledGaps.removeAll(contenders)
+
+        for (WorkflowExtension extension : extensions) {
+            resolveOwner(extension, pluginKeys, firstClassOwners, moduleClassOwners)
+            settleClassOwner(extension, classReaders.get(extension.className), contenders, disabledGaps)
+            if (extension.ownerPluginKey != null) {
+                identifyModule(extension, keysByPlugin.get(extension.ownerPluginKey))
+            }
+        }
+    }
+
+    static void settleClassOwner(WorkflowExtension extension, Set<String> readers,
+                                 Set<String> contenders, Set<String> disabledGaps) {
+        if (BY_MODULE_KEY == extension.attribution) {
+            return
+        }
+        String owner = extension.ownerPluginKey
+        if (owner == null) {
+            boolean gapPossible = extension.className != null &&
+                !(contenders.isEmpty() && disabledGaps.isEmpty())
+            openPosition(extension, gapPossible ? OPEN_CLASS_CATALOG_INCOMPLETE : OPEN_NOT_PROVEN,
+                gapPossible ? contenders : Collections.<String>emptySet(),
+                gapPossible ? disabledGaps : Collections.<String>emptySet())
+            return
+        }
+        Set<String> candidates = new TreeSet<String>(contenders)
+        candidates.remove(owner)
+        boolean ambiguous = readers != null && readers.size() > 1
+        if (!ambiguous && candidates.isEmpty()) {
+            return
+        }
+        candidates.add(owner)
+        if (readers != null) {
+            candidates.addAll(readers)
+        }
+        openPosition(extension, ambiguous ? OPEN_AMBIGUOUS : OPEN_CLASS_CATALOG_INCOMPLETE,
+            candidates, Collections.<String>emptySet())
+    }
+
+    static void openPosition(WorkflowExtension extension, String reason, Set<String> candidates,
+                             Set<String> disabledCandidates) {
+        extension.ownerPluginKey = null
+        extension.attribution = null
+        extension.openReason = reason
+        extension.openCandidates = new ArrayList<String>(candidates)
+        extension.openDisabledCandidates = new ArrayList<String>(disabledCandidates)
+    }
+
+    /* Tells each app what the attribution left open for it. Runs before finish(). */
+    static void markOpenPositions(Collection<AppFootprint> apps, Collection<WorkflowExtension> extensions,
+                                  boolean walkComplete) {
+        Map<String, Integer> counts = new HashMap<String, Integer>()
+        for (WorkflowExtension extension : extensions) {
+            for (String candidate : extension.openCandidates) {
+                counts.merge(candidate, Integer.valueOf(1), { Integer a, Integer b -> a + b })
+            }
+        }
+        for (AppFootprint app : apps) {
+            app.openWorkflowPositions = counts.getOrDefault(app.pluginKey, Integer.valueOf(0)).intValue()
+            app.workflowWalkIncomplete = !walkComplete
+        }
+    }
+
+    /* Jira's own functions land here on every instance, thousands of positions of a few
+     * classes, so one row per class and reason is what stays readable. The count is exact;
+     * only the examples are cut, and the result says so. */
+    static final int OPEN_POSITION_EXAMPLES = 5
+
+    static List<Map<String, Object>> groupOpenPositions(Collection<WorkflowExtension> extensions) {
+        Map<String, Map<String, Object>> groups = new TreeMap<String, Map<String, Object>>()
+        Map<String, Set<String>> workflows = new HashMap<String, Set<String>>()
+        for (WorkflowExtension extension : extensions) {
+            if (extension.openReason == null) {
+                continue
+            }
+            String evidence = extension.className ?: (extension.fullModuleKey ?:
+                (extension.type != null ? "type: " + extension.type : "no class or type"))
+            String key = evidence + " " + extension.openReason
+            Map<String, Object> group = groups.get(key)
+            if (group == null) {
+                group = [evidence: evidence, reason: extension.openReason, positions: 0,
+                         kinds: new TreeSet<String>(), workflows: 0,
+                         candidates: extension.openCandidates,
+                         disabledCandidates: extension.openDisabledCandidates,
+                         examples: new ArrayList<String>(), examplesTruncated: false] as LinkedHashMap
+                groups.put(key, group)
+                workflows.put(key, new TreeSet<String>())
+            }
+            group.positions = ((int) group.positions) + 1
+            if (extension.kind != null) {
+                ((Set<String>) group.kinds).add(extension.kind)
+            }
+            workflows.get(key).add(nullSafe(extension.workflowName))
+            group.workflows = workflows.get(key).size()
+            List<String> examples = (List<String>) group.examples
+            if (examples.size() < OPEN_POSITION_EXAMPLES) {
+                examples.add(nullSafe(extension.workflowName) + " / " +
+                    (extension.transitionName ?: nullSafe(extension.scope)) + " / " +
+                    nullSafe(extension.kind) + " #" + extension.position)
+            } else {
+                group.examplesTruncated = true
+            }
+        }
+        List<Map<String, Object>> result = new ArrayList<Map<String, Object>>()
+        for (Map<String, Object> group : groups.values()) {
+            group.kinds = new ArrayList<String>((Set<String>) group.kinds)
+            result.add(group)
+        }
+        /* a row an app could be behind comes first, whatever the alphabet says */
+        result.sort { Map<String, Object> group ->
+            !((List) group.candidates).isEmpty() ? 0 : (!((List) group.disabledCandidates).isEmpty() ? 1 : 2)
+        }
+        return result
+    }
+
+    static int openPositionTotal(Collection<Map<String, Object>> groups) {
+        int total = 0
+        for (Map<String, Object> group : groups) {
+            total += (int) group.positions
+        }
+        return total
+    }
+
+    static List<Map<String, Object>> workflowModuleDiagnostics(Collection<AppFootprint> apps) {
+        List<Map<String, Object>> rows = new ArrayList<Map<String, Object>>()
+        for (AppFootprint app : apps) {
+            rows.addAll(app.workflowModuleDiagnostics())
+        }
+        return rows
+    }
+
+    static Map<String, Object> workflowAttributionMap(Collection<AppFootprint> apps,
+                                                      List<Map<String, Object>> groups, boolean complete) {
+        return [
+            unattributedExtensionPoints: openPositionTotal(groups),
+            complete: complete,
+            positions: groups,
+            moduleDiagnostics: workflowModuleDiagnostics(apps)
+        ] as LinkedHashMap
+    }
+
+    /* New columns only ever go at the end, so that every existing one keeps its position. */
+    static final String WORKFLOW_CSV_COLUMNS =
+        "workflowModulesEnabled,workflowModulesDisabled,workflowModulesUnknown,workflowModuleDiagnostics," +
+        "openWorkflowPositions,unattributedExtensionPoints,unattributedExtensionPointReasons"
+
+    /* The two positional totals repeat in every row: this format has no summary line. */
+    static String workflowCsvCells(AppFootprint app, List<Map<String, Object>> groups) {
+        List<String> notes = new ArrayList<String>()
+        for (Map<String, Object> row : app.workflowModuleDiagnostics()) {
+            notes.add(row.module + " " + row.code)
+        }
+        Map<String, Integer> reasons = new TreeMap<String, Integer>()
+        for (Map<String, Object> group : groups) {
+            reasons.merge((String) group.reason, (Integer) group.positions, { Integer a, Integer b -> a + b })
+        }
+        List<String> reasonCells = new ArrayList<String>()
+        for (Map.Entry<String, Integer> reason : reasons.entrySet()) {
+            reasonCells.add(reason.key + "=" + reason.value)
+        }
+        if (app.workflowWalkIncomplete) {
+            reasonCells.add(WALK_INCOMPLETE)
+        }
+        return [app.workflowModulesEnabled, app.workflowModulesDisabled, app.workflowModulesUnknown,
+                csv(String.join(" | ", notes)), app.openWorkflowPositions, openPositionTotal(groups),
+                csv(String.join(" | ", reasonCells))].join(",")
+    }
+
+    /* ---- what the report says about it ---------------------------------------- */
+
+    static String moduleStateLabel(Boolean enabled) {
+        return enabled == null ? "Unknown" : (enabled ? "Enabled" : "Disabled")
+    }
+
+    /* The empty state of the extension point section. Only ever shown without an entry. */
+    static String capabilityNote(AppFootprint app, Locale locale) {
+        String modules = number(app.workflowModuleKeys.size(), locale)
+        if (CAPABILITY_DORMANT == app.workflowCapability) {
+            return "Dormant capability. This app registers " + modules + " workflow extension module(s) " +
+                "and none of them is configured in any workflow on this instance. Nothing uses it today, " +
+                "and nothing stops an administrator from using it tomorrow."
+        }
+        if (CAPABILITY_DISABLED_ONLY == app.workflowCapability) {
+            return "Disabled modules only. This app registers " + modules + " workflow extension module(s) " +
+                "and every one of them is disabled, so no position is attributed to it here. A workflow can " +
+                "still carry an entry of a disabled module: see the workflow attribution notes of this report."
+        }
+        if (CAPABILITY_UNKNOWN == app.workflowCapability) {
+            return "Unknown. Whether this app contributes to a workflow could not be established. " +
+                (app.workflowModuleListUnread ? "Its module list could not be read. " : "") +
+                (app.workflowModulesUnknown > 0 ? "The state of " + number(app.workflowModulesUnknown, locale) +
+                    " module(s) could not be read. " : "") +
+                (app.openWorkflowPositions > 0 ? "It is a possible owner of " +
+                    number(app.openWorkflowPositions, locale) + " unattributed position(s). " : "") +
+                (app.workflowWalkIncomplete ? "At least one workflow could not be walked." : "")
+        }
+        return ""
+    }
+
+    static String extensionPointCell(AppFootprint app, Locale locale) {
+        if (CAPABILITY_DORMANT == app.workflowCapability) {
+            return '<span class="muted" title="Workflow modules are installed but none is configured">dormant</span>'
+        }
+        if (CAPABILITY_DISABLED_ONLY == app.workflowCapability) {
+            return '<span class="muted" title="Every workflow module of this app is disabled">disabled</span>'
+        }
+        if (CAPABILITY_UNKNOWN == app.workflowCapability) {
+            return '<span class="warn" title="Could not be established, see the app\'s workflow section">unknown</span>'
+        }
+        boolean lowerBound = app.openWorkflowPositions > 0 || app.workflowWalkIncomplete
+        return html(number(app.extensionPointCount, locale)) + (lowerBound ?
+            '<span class="warn" title="Incomplete, lower bound">&#42;</span>' : "")
+    }
+
+    static String extensionPointLabel(AppFootprint app, Locale locale) {
+        if (app.extensionPointCount > 0) {
+            return " &middot; " + number(app.postFunctionCount, locale) + " Post Fn"
+        }
+        String modules = number(app.workflowModuleKeys.size(), locale)
+        if (CAPABILITY_DORMANT == app.workflowCapability) {
+            return " &middot; " + modules + " available"
+        }
+        if (CAPABILITY_DISABLED_ONLY == app.workflowCapability) {
+            return " &middot; " + modules + " disabled"
+        }
+        return ""
+    }
+
+    /* One app's module notes, for its own card. */
+    static String workflowModuleNotesHtml(AppFootprint app) {
+        List<Map<String, Object>> rows = app.workflowModuleDiagnostics()
+        if (rows.isEmpty()) {
+            return ""
+        }
+        StringBuilder out = new StringBuilder('    <ul class="impact-reasons">\n')
+        for (Map<String, Object> row : rows) {
+            out.append('        <li><span class="mono">').append(html(row.module))
+                .append('</span>: ').append(html(row.reason)).append('</li>\n')
+        }
+        return out.append('    </ul>\n').toString()
+    }
+
+    private static void tableRow(StringBuilder out, List<Object> cells) {
+        out.append('            <tr>')
+        for (Object cell : cells) {
+            out.append('<td>').append(html(cell)).append('</td>')
+        }
+        out.append('</tr>\n')
+    }
+
+    private static void tableHead(StringBuilder out, List<String> columns) {
+        out.append('    <div class="table-wrap">\n        <table>\n            <thead><tr>')
+        for (String column : columns) {
+            out.append('<th>').append(html(column)).append('</th>')
+        }
+        out.append('</tr></thead>\n            <tbody>\n')
+    }
+
+    private static void tableFoot(StringBuilder out) {
+        out.append('            </tbody>\n        </table>\n    </div>\n')
+    }
+
+    /*
+     * The report-wide list of what the attribution could not settle. It is shown even
+     * where nothing failed: a disabled module is not a read error, so the measurement
+     * notes box would stay away, and silence is exactly how this defect got through.
+     */
+    static String workflowAttributionHtml(Collection<AppFootprint> apps, List<Map<String, Object>> groups,
+                                          boolean walkComplete, Locale locale) {
+        List<Map<String, Object>> notes = workflowModuleDiagnostics(apps)
+        if (notes.isEmpty() && groups.isEmpty()) {
+            return ""
+        }
+        boolean degraded = notes.any { OBSERVATION != it.kind } ||
+            groups.any { !((List) it.candidates).isEmpty() }
+        StringBuilder out = new StringBuilder('<div class="').append(degraded ? DIAG_WARN : DIAG_INFO)
+            .append('">\n    <strong>Workflow attribution</strong>\n')
+        if (!notes.isEmpty()) {
+            out.append('    <details>\n        <summary>').append(html(number(notes.size(), locale)))
+                .append(' workflow module note(s)</summary>\n')
+            tableHead(out, ["App", "Module", "State", "Code", "Reason"])
+            for (Map<String, Object> note : notes) {
+                tableRow(out, [note.appName, note.module, note.state, note.code, note.reason])
+            }
+            tableFoot(out)
+            out.append('    </details>\n')
+        }
+        if (!groups.isEmpty()) {
+            out.append('    <details>\n        <summary>').append(html(number(openPositionTotal(groups), locale)))
+                .append(' workflow position(s) without an owner')
+                .append(walkComplete ? '' : ', a lower bound because a workflow could not be walked')
+                .append('</summary>\n        <p>These positions are in no app\'s numbers. Jira\'s own functions ')
+                .append('belong to no app and land here, as does the class of any app this scan did not read. ')
+                .append('Where an app could be behind a position, it is named.</p>\n')
+            tableHead(out, ["Class or key", "Positions", "Kinds", "Workflows", "Reason",
+                            "Possible owners", "Possible, module disabled", "Examples"])
+            for (Map<String, Object> group : groups) {
+                tableRow(out, [group.evidence, number((Number) group.positions, locale),
+                    String.join(", ", (List<String>) group.kinds), number((Number) group.workflows, locale),
+                    group.reason, String.join(", ", (List<String>) group.candidates),
+                    String.join(", ", (List<String>) group.disabledCandidates),
+                    String.join("; ", (List<String>) group.examples) + (group.examplesTruncated ? "; ..." : "")])
+            }
+            tableFoot(out)
+            out.append('    </details>\n')
+        }
+        return out.append('</div>\n').toString()
     }
 
     /*
@@ -1393,6 +1837,11 @@ class WorkflowExtension {
     int followedByOther
     boolean orderingRisk
 
+    /* set when no owner could be proven: why, and who could still be behind it */
+    String openReason
+    List<String> openCandidates = new ArrayList<String>()
+    List<String> openDisabledCandidates = new ArrayList<String>()
+
     Map<String, Object> asMap() {
         return [
             workflow: workflowName,
@@ -1415,6 +1864,41 @@ class WorkflowExtension {
             followedByOther: followedByOther,
             orderingRisk: orderingRisk
         ] as LinkedHashMap
+    }
+}
+
+/*
+ * One registered workflow module as far as it could be read. Enablement and class are
+ * separate facts: either can be missing without saying anything about the other.
+ */
+class WorkflowModuleRead {
+
+    String pluginKey
+    String moduleKey
+    String completeKey
+    Boolean enabled
+    String className
+
+    /* set when the class getter threw, as opposed to answering null */
+    String failure
+
+    /* Only a proven disabled module with a getter that answered may stay out of a contest. */
+    boolean competesForClass() {
+        return className == null && (failure != null || enabled != Boolean.FALSE)
+    }
+
+    List<String> codes() {
+        List<String> codes = new ArrayList<String>()
+        if (enabled == null) {
+            codes.add(Fp.MODULE_ENABLEMENT_UNAVAILABLE)
+        }
+        if (failure != null) {
+            codes.add(Fp.MODULE_IMPLEMENTATION_READ_FAILED)
+        } else if (className == null) {
+            codes.add(enabled == null ? Fp.MODULE_CLASS_UNAVAILABLE_ENABLEMENT_UNKNOWN :
+                (enabled ? Fp.ENABLED_MODULE_CLASS_UNAVAILABLE : Fp.DISABLED_MODULE_CLASS_UNAVAILABLE))
+        }
+        return codes
     }
 }
 
@@ -1680,8 +2164,12 @@ class AppFootprint {
     List<WorkflowReference> workflowReferences = new ArrayList<WorkflowReference>()
     List<WorkflowExtension> workflowExtensions = new ArrayList<WorkflowExtension>()
 
-    /* workflow modules this app registers, whether or not any is configured */
+    /* workflow modules this app registers, whether or not any is configured or enabled */
     List<String> workflowModuleKeys = new ArrayList<String>()
+    List<WorkflowModuleRead> workflowModuleReads = new ArrayList<WorkflowModuleRead>()
+    boolean workflowModuleListUnread
+    int openWorkflowPositions
+    boolean workflowWalkIncomplete
     List<String> diagnostics = new ArrayList<String>()
 
     /* aggregates, computed exactly once by finish() */
@@ -1711,6 +2199,9 @@ class AppFootprint {
     int extensionWorkflowCount
     int extensionTransitionCount
     int orderingRiskCount
+    int workflowModulesEnabled
+    int workflowModulesDisabled
+    int workflowModulesUnknown
     String workflowCapability = Fp.CAPABILITY_NONE
 
     int footprintSignals
@@ -1733,6 +2224,41 @@ class AppFootprint {
     Long archivedImpactedIssues
     boolean activeImpactPartial
     boolean archivedImpactPartial
+
+    /*
+     * A disabled module is an observation and stays out of diagnostics, whose every entry
+     * counts as a read error. An enabled module without a class is not expected and did
+     * not throw either: it goes in with its own code, so it degrades the report visibly
+     * and is still told apart from a read that failed. The enablement failure itself was
+     * noted when it happened.
+     */
+    void recordWorkflowModule(WorkflowModuleRead read) {
+        if (read.moduleKey == null || read.moduleKey.isEmpty() ||
+            workflowModuleKeys.contains(read.moduleKey)) {
+            return
+        }
+        workflowModuleKeys.add(read.moduleKey)
+        workflowModuleReads.add(read)
+        if (read.failure != null) {
+            diagnostics.add(Fp.MODULE_IMPLEMENTATION_READ_FAILED + " " + read.completeKey + " -> " + read.failure)
+        } else if (read.competesForClass()) {
+            diagnostics.add(read.codes().last() + " " + read.completeKey + " -> the class getter returned null")
+        }
+    }
+
+    List<Map<String, Object>> workflowModuleDiagnostics() {
+        List<Map<String, Object>> rows = new ArrayList<Map<String, Object>>()
+        for (WorkflowModuleRead read : workflowModuleReads) {
+            for (String code : read.codes()) {
+                List<String> issue = Fp.MODULE_ISSUES.get(code)
+                rows.add([app: pluginKey, appName: displayName, module: read.completeKey,
+                          state: Fp.moduleStateLabel(read.enabled), code: code, kind: issue.get(0),
+                          reason: issue.get(1) + (code == Fp.MODULE_IMPLEMENTATION_READ_FAILED ?
+                              " " + read.failure : "")] as LinkedHashMap)
+            }
+        }
+        return rows
+    }
 
     void finish() {
         finish(null, null)
@@ -1876,7 +2402,21 @@ class AppFootprint {
         }
         extensionWorkflowCount = extensionWorkflows.size()
         extensionTransitionCount = extensionTransitions.size()
-        workflowCapability = Fp.workflowCapability(workflowModuleKeys.size(), extensionPointCount)
+        workflowModulesEnabled = 0
+        workflowModulesDisabled = 0
+        workflowModulesUnknown = 0
+        for (WorkflowModuleRead read : workflowModuleReads) {
+            if (read.enabled == null) {
+                workflowModulesUnknown++
+            } else if (read.enabled) {
+                workflowModulesEnabled++
+            } else {
+                workflowModulesDisabled++
+            }
+        }
+        workflowCapability = Fp.workflowCapability(workflowModulesEnabled, workflowModulesDisabled,
+            workflowModulesUnknown, workflowModuleListUnread,
+            openWorkflowPositions > 0 || workflowWalkIncomplete, extensionPointCount)
 
         /*
          * An extension point counts as detection: the structural walk finds one
@@ -2121,6 +2661,12 @@ class AppFootprint {
                 workflowCapability: workflowCapability,
                 workflowModules: workflowModuleKeys.size(),
                 workflowModuleKeys: workflowModuleKeys,
+                workflowModulesEnabled: workflowModulesEnabled,
+                workflowModulesDisabled: workflowModulesDisabled,
+                workflowModulesUnknown: workflowModulesUnknown,
+                workflowModuleListUnread: workflowModuleListUnread,
+                workflowModuleDiagnostics: workflowModuleDiagnostics(),
+                openWorkflowPositions: openWorkflowPositions,
                 extensionPoints: extensionPointCount,
                 postFunctions: postFunctionCount,
                 conditions: conditionCount,
@@ -3426,7 +3972,7 @@ appFootprint(
 
     List<WorkflowSnapshot> workflowSnapshots = new ArrayList<WorkflowSnapshot>()
     List<WorkflowExtension> allWorkflowExtensions = new ArrayList<WorkflowExtension>()
-    boolean workflowExtensionWalkComplete = true
+    boolean workflowExtensionWalkComplete = workflowInventoryComplete
     long workflowXmlBytes = 0L
     long workflowDistinctTokens = 0L
 
@@ -3780,7 +4326,7 @@ appFootprint(
     /*
      * Two class indexes, deliberately separate and consulted in this order.
      *
-     * implementationClassOwners is authoritative: Jira writes class.name from
+     * The workflow module reads are authoritative: Jira writes class.name from
      * AbstractWorkflowModuleDescriptor.getImplementationClass(), verified in the
      * bytecode of all three writers (function, condition, validator params), so
      * this is exactly the string that lands in a descriptor.
@@ -3791,9 +4337,9 @@ appFootprint(
      * com.atlassian.jira.plugin.workflow.WorkflowPluginConditionFactory. Trusting
      * it first would hand a Jira class to whichever app registered it first.
      */
-    Map<String, String> implementationClassOwners = new HashMap<String, String>()
+    List<WorkflowModuleRead> allWorkflowModuleReads = new ArrayList<WorkflowModuleRead>()
+    Set<String> unreadModuleLists = new TreeSet<String>()
     Map<String, String> moduleClassOwners = new HashMap<String, String>()
-    Map<String, Set<String>> moduleKeysByPlugin = new HashMap<String, Set<String>>()
     Map<CustomFieldFootprint, CustomField> appCustomFieldSources =
         new LinkedHashMap<CustomFieldFootprint, CustomField>()
     int issueCountsSkippedByBudget = 0
@@ -3853,6 +4399,8 @@ appFootprint(
             descriptors = plugin.getModuleDescriptors()
         } catch (Throwable error) {
             Fp.note(app.diagnostics, "module descriptors", error)
+            app.workflowModuleListUnread = true
+            unreadModuleLists.add(app.pluginKey)
         }
 
         for (ModuleDescriptor<?> descriptor : descriptors) {
@@ -3864,12 +4412,7 @@ appFootprint(
             module.descriptorClass = descriptor.getClass().getName()
             module.category = Fp.extensionCategory(module.descriptorName)
 
-            try {
-                module.enabled = Boolean.valueOf(pluginAccessor.isPluginModuleEnabled(module.completeKey))
-            } catch (Exception error) {
-                module.enabled = null
-                Fp.note(app.diagnostics, "module enabled flag " + module.completeKey, error)
-            }
+            module.enabled = Fp.readModuleEnablement(pluginAccessor, module.completeKey, app.diagnostics)
 
             try {
                 Class<?> moduleClazz = descriptor.getModuleClass()
@@ -3880,46 +4423,32 @@ appFootprint(
                         moduleClassOwners.putIfAbsent(module.moduleClass, app.pluginKey)
                     }
                 }
-            } catch (Throwable ignored) {
+            } catch (Throwable error) {
                 module.moduleClass = null
+                Fp.note(app.diagnostics, "module class " + module.completeKey, error)
             }
 
             /*
-             * Only workflow module descriptors answer this, so the duck-typed
-             * call is also the type test. It is what makes an app condition or
-             * validator attributable at all.
+             * Being a workflow module is decided by the descriptor, not by the class
+             * it hands back, so a disabled module stays registered. This is also the
+             * filter that keeps web resources, servlets and REST modules out of the
+             * candidate set used to name the module behind an entry.
              *
-             * It also joins the needles of the text scan. That scan only reaches
-             * for class needles when the plugin key produced no hit whatsoever,
-             * so this cannot inflate a count that already exists. What it fixes
-             * is the app whose ONLY workflow footprint is a condition or a
-             * validator: the plugin key appears nowhere in such a descriptor,
-             * and getModuleClass() hands back a Jira factory that appears
-             * nowhere either, so the workflow went unlisted entirely.
+             * A read class joins the needles of the text scan. That scan only reaches
+             * for class needles when the plugin key produced no hit whatsoever, so
+             * this cannot inflate a count that already exists. What it fixes is the
+             * app whose ONLY workflow footprint is a condition or a validator: the
+             * plugin key appears nowhere in such a descriptor, and getModuleClass()
+             * hands back a Jira factory that appears nowhere either, so the workflow
+             * went unlisted entirely.
              */
-            Object implementation = Fp.safeCall(descriptor, "getImplementationClass")
-            if (implementation instanceof Class) {
-                String implementationName = ((Class) implementation).getName()
-                if (!implementationName.startsWith("java.") && !implementationName.startsWith("groovy.")) {
-                    implementationClassOwners.putIfAbsent(implementationName, app.pluginKey)
-                    moduleClasses.add(implementationName)
-                }
-                /*
-                 * Answering getImplementationClass() is what makes this a
-                 * workflow module, so this is also the filter that keeps web
-                 * resources, servlets and REST modules out of the candidate set
-                 * used to name the module behind an entry.
-                 */
-                if (module.key != null && !module.key.isEmpty()) {
-                    Set<String> keysForApp = moduleKeysByPlugin.get(app.pluginKey)
-                    if (keysForApp == null) {
-                        keysForApp = new TreeSet<String>()
-                        moduleKeysByPlugin.put(app.pluginKey, keysForApp)
-                    }
-                    keysForApp.add(module.key)
-                    if (!app.workflowModuleKeys.contains(module.key)) {
-                        app.workflowModuleKeys.add(module.key)
-                    }
+            WorkflowModuleRead workflowRead = Fp.readWorkflowModule(descriptor, app.pluginKey, module.key,
+                module.completeKey, module.enabled)
+            if (workflowRead != null) {
+                allWorkflowModuleReads.add(workflowRead)
+                app.recordWorkflowModule(workflowRead)
+                if (workflowRead.className != null && Fp.isAppClassName(workflowRead.className)) {
+                    moduleClasses.add(workflowRead.className)
                 }
             }
 
@@ -4328,13 +4857,11 @@ appFootprint(
         }
     }
 
-    for (WorkflowExtension extension : allWorkflowExtensions) {
-        Fp.resolveOwner(extension, attributionPluginKeys,
-            implementationClassOwners, moduleClassOwners)
-        if (extension.ownerPluginKey != null) {
-            Fp.identifyModule(extension, moduleKeysByPlugin.get(extension.ownerPluginKey))
-        }
-    }
+    Fp.attributeExtensions(allWorkflowExtensions, attributionPluginKeys, moduleClassOwners,
+        allWorkflowModuleReads, unreadModuleLists)
+    Fp.markOpenPositions(apps, allWorkflowExtensions, workflowExtensionWalkComplete)
+    List<Map<String, Object>> openPositionGroups = Fp.groupOpenPositions(allWorkflowExtensions)
+    int unattributedExtensionPoints = Fp.openPositionTotal(openPositionGroups)
 
     Fp.markOrdering(allWorkflowExtensions)
 
@@ -4461,6 +4988,12 @@ appFootprint(
     int totalWorkflowReferences = 0
     int totalExtensionPoints = 0
     int totalDormantWorkflowApps = 0
+    int totalDisabledOnlyWorkflowApps = 0
+    int totalUnknownWorkflowApps = 0
+    int totalWorkflowModules = 0
+    int totalWorkflowModulesEnabled = 0
+    int totalWorkflowModulesDisabled = 0
+    int totalWorkflowModulesUnknown = 0
     int totalPostFunctions = 0
     int totalOrderingRisks = 0
     int totalDiagnostics = globalDiagnostics.size()
@@ -4513,14 +5046,23 @@ appFootprint(
         totalExtensionPoints += app.extensionPointCount
         if (Fp.CAPABILITY_DORMANT == app.workflowCapability) {
             totalDormantWorkflowApps++
+        } else if (Fp.CAPABILITY_DISABLED_ONLY == app.workflowCapability) {
+            totalDisabledOnlyWorkflowApps++
+        } else if (Fp.CAPABILITY_UNKNOWN == app.workflowCapability) {
+            totalUnknownWorkflowApps++
         }
+        totalWorkflowModules += app.workflowModuleKeys.size()
+        totalWorkflowModulesEnabled += app.workflowModulesEnabled
+        totalWorkflowModulesDisabled += app.workflowModulesDisabled
+        totalWorkflowModulesUnknown += app.workflowModulesUnknown
         totalPostFunctions += app.postFunctionCount
         totalOrderingRisks += app.orderingRiskCount
         totalDiagnostics += app.diagnosticCount
     }
 
-    /* Per-app diagnostics are all read errors here, Fp.note being their only
-     * source, so the observations are exactly the global ones. */
+    /* Per-app diagnostics are all read errors here: Fp.note, or an enabled module that
+     * delivered no class. So the observations in this sum are exactly the global ones.
+     * A disabled module is an observation of its own and is not in the sum at all. */
     int totalReadErrors = totalDiagnostics - totalObservations
 
     /*
@@ -4668,6 +5210,14 @@ appFootprint(
                 postFunctions: totalPostFunctions,
                 orderingRisks: totalOrderingRisks,
                 extensionWalkComplete: workflowExtensionWalkComplete,
+                unattributedExtensionPoints: unattributedExtensionPoints,
+                workflowModules: totalWorkflowModules,
+                workflowModulesEnabled: totalWorkflowModulesEnabled,
+                workflowModulesDisabled: totalWorkflowModulesDisabled,
+                workflowModulesUnknown: totalWorkflowModulesUnknown,
+                workflowCapabilityDormantApps: totalDormantWorkflowApps,
+                workflowCapabilityDisabledOnlyApps: totalDisabledOnlyWorkflowApps,
+                workflowCapabilityUnknownApps: totalUnknownWorkflowApps,
                 reachState: reachSummaryState,
                 impactedProjects: Fp.measuredValue(
                     reachSummaryState, Integer.valueOf(allImpactedProjects.size())),
@@ -4709,6 +5259,7 @@ appFootprint(
             ] as LinkedHashMap,
             diagnostics: globalDiagnostics,
             observations: globalObservations,
+            workflowAttribution: Fp.workflowAttributionMap(apps, openPositionGroups, workflowExtensionWalkComplete),
             apps: appMaps
         ] as LinkedHashMap
 
@@ -4735,7 +5286,7 @@ appFootprint(
         csv.append("extensionPoints,postFunctions,conditions,validators,preFunctions,")
         csv.append("extensionWorkflows,extensionTransitions,orderingRisks,")
         csv.append("impactedProjects,impactedIssues,activeImpactedProjects,archivedImpactedProjects,unknownImpactedProjects,activeImpactedIssues,archivedImpactedIssues,reachState,activeReachState,archivedReachState,impactComplete,restModules,servletModules,")
-        csv.append("detectedFootprint,diagnostics\n")
+        csv.append("detectedFootprint,diagnostics,${Fp.WORKFLOW_CSV_COLUMNS}\n")
 
         for (AppFootprint app : apps) {
             ImpactAssessment impact = impacts.get(app.pluginKey)
@@ -4807,7 +5358,8 @@ appFootprint(
             csv.append(app.restModules).append(",")
             csv.append(app.servletModules).append(",")
             csv.append(app.detected).append(",")
-            csv.append(app.diagnosticCount).append("\n")
+            csv.append(app.diagnosticCount).append(",")
+            csv.append(Fp.workflowCsvCells(app, openPositionGroups)).append("\n")
         }
 
         return responseClass
@@ -5283,8 +5835,12 @@ summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--blue)
         <div class="summary-label">Ordering Dependencies</div>
     </div>
     <div class="summary-card">
-        <div class="summary-value">${num(totalDormantWorkflowApps)}</div>
+        <div class="summary-value">${num(totalDormantWorkflowApps)}${totalUnknownWorkflowApps > 0 ? '<span class="warn" title="The workflow capability of at least one app could not be established, this is a lower bound">&#42;</span>' : ""}</div>
         <div class="summary-label">Dormant Workflow Capability</div>
+    </div>
+    <div class="summary-card">
+        <div class="summary-value">${num(unattributedExtensionPoints)}${workflowExtensionWalkComplete ? "" : '<span class="warn" title="At least one workflow could not be walked, this is a lower bound">&#42;</span>'}</div>
+        <div class="summary-label">Workflow Positions Without Owner</div>
     </div>
     <div class="summary-card">
         <div class="summary-value">${includeReach ? num(allActiveImpactedSpaces.size()) : '<span class="muted">off</span>'}</div>
@@ -5363,6 +5919,8 @@ summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--blue)
 </div>
 """)
     }
+
+    html.append(Fp.workflowAttributionHtml(apps, openPositionGroups, workflowExtensionWalkComplete, numberLocale))
 
     /* ---- Confluence page export card --------------------------------------- */
 
@@ -5586,8 +6144,8 @@ summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--blue)
         <div class="metric-label">Workflow References</div>
     </div>
     <div class="metric">
-        <div class="metric-value">${Fp.CAPABILITY_DORMANT == app.workflowCapability ? '<span class="muted" title="Workflow modules are installed but none is configured">dormant</span>' : num(app.extensionPointCount)}</div>
-        <div class="metric-label">Extension Points${app.extensionPointCount > 0 ? " &middot; " + num(app.postFunctionCount) + " Post Fn" : (Fp.CAPABILITY_DORMANT == app.workflowCapability ? " &middot; " + num(app.workflowModuleKeys.size()) + " available" : "")}</div>
+        <div class="metric-value">${Fp.extensionPointCell(app, numberLocale)}</div>
+        <div class="metric-label">Extension Points${Fp.extensionPointLabel(app, numberLocale)}</div>
     </div>
     <div class="metric">
         <div class="metric-value">${app.orderingRiskCount > 0 ? '<span class="warn">' + num(app.orderingRiskCount) + '</span>' : num(app.orderingRiskCount)}</div>
@@ -5855,17 +6413,19 @@ summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--blue)
 """)
 
         if (app.workflowExtensions.isEmpty()) {
-            html.append("""    <div class="empty">Dormant capability. This app registers ${num(app.workflowModuleKeys.size())} workflow extension module(s) and none of them is configured in any workflow on this instance. Nothing uses it today, and nothing stops an administrator from using it tomorrow.</div>
-    <details>
+            html.append("""    <div class="empty">${esc(Fp.capabilityNote(app, numberLocale))}</div>\n""")
+            if (!app.workflowModuleKeys.isEmpty()) {
+                html.append("""    <details>
         <summary>The ${num(app.workflowModuleKeys.size())} module(s) it could contribute</summary>
         <ul>
 """)
-            for (String moduleKey : app.workflowModuleKeys) {
-                html.append("""            <li class="mono">${esc(moduleKey)}</li>\n""")
-            }
-            html.append("""        </ul>
+                for (String moduleKey : app.workflowModuleKeys) {
+                    html.append("""            <li class="mono">${esc(moduleKey)}</li>\n""")
+                }
+                html.append("""        </ul>
     </details>
 """)
+            }
         } else {
             List<WorkflowExtension> ordered = new ArrayList<WorkflowExtension>(app.workflowExtensions)
             ordered.sort { WorkflowExtension a, WorkflowExtension b ->
@@ -5954,6 +6514,7 @@ summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--blue)
             }
         }
 
+        html.append(Fp.workflowModuleNotesHtml(app))
         html.append("""</div>
 """)
 

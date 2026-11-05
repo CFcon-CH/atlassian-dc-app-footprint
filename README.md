@@ -328,10 +328,53 @@ is worth a line of its own: the capability is installed, nothing uses it, and no
 can show it precisely because it is not being used. An administrator can enable it the day
 after an assessment was signed off.
 
-The report therefore separates three states rather than two. An app registering no workflow
-module gets no section at all. An app registering modules with none configured is reported as
-a **dormant capability**, with the modules it could contribute listed. An app with configured
-extension points gets the table above. The instance summary counts the dormant ones.
+The report therefore separates these states rather than two. An app registering no workflow
+module gets no section at all. An app with at least one module proven enabled and none
+configured is reported as a **dormant capability**, with the modules it could contribute listed.
+An app whose modules are all proven disabled is reported as **Disabled modules only**, never as
+having none. An app with configured extension points gets the table above. **Unknown** means an
+unreadable fact could change the verdict: a module list or a module state that could not be
+read, a position this app could own that stayed open, or a workflow that could not be walked. A
+configured extension point wins over all of these. The instance summary counts the dormant ones
+and marks that count when an app's verdict is unknown.
+
+`workflowModules` counts registered modules, disabled ones included, with the enabled, disabled
+and unknown counts next to it. A module is recognised by what its descriptor declares and not by
+the class it returns, because `getImplementationClass()` returns null for every disabled module.
+
+| The module's class getter | Enabled | Reported as | Read error |
+| --- | --- | --- | --- |
+| returned a class | any | the class is evidence, whatever the state | no |
+| returned null | no | `DISABLED_MODULE_CLASS_UNAVAILABLE`, an expected observation | no |
+| returned null | yes | `ENABLED_MODULE_CLASS_UNAVAILABLE` | yes |
+| returned null | unreadable | `MODULE_CLASS_UNAVAILABLE_ENABLEMENT_UNKNOWN` | yes |
+| threw | any | `MODULE_IMPLEMENTATION_READ_FAILED` | yes |
+
+An unreadable enablement also reports `MODULE_ENABLEMENT_UNAVAILABLE` and counts as a read error
+of its own.
+
+### Workflow positions without an owner
+
+A module whose class was not read can be behind any class-only position, and that limits what the
+class path may claim. Key and prefix attribution are not affected.
+
+- A class read by exactly one app keeps that app as owner. A proven disabled module does not
+  contest it: its missing class is the expected state.
+- An enabled module without a class, a module of unknown state, a failed read or an unreadable
+  module list does contest it. The position stays open and names both apps as possible owners.
+- A class read by two apps has no owner either (`OWNERSHIP_AMBIGUOUS`), rather than whichever app
+  was read first.
+- A class no app read stays open as well. Where a class could not be read it says
+  `WORKFLOW_CLASS_CATALOG_INCOMPLETE` and names the apps, otherwise `OWNER_NOT_PROVEN`.
+
+An open position is in no app's numbers, and it no longer disappears. The summary carries
+`unattributedExtensionPoints`, and the **Workflow attribution** block lists one row per class and
+reason with an exact position count and a few examples. Expect a large number on any instance:
+Jira's own functions belong to no app and land here, as does the class of any app the chosen
+filters did not read. What this does not do is feed the impact level, which is measured from
+fields and references. A count of possible owners is not a footprint. The limit runs the other
+way too: the text scan cannot search for a class it could not read, so a class-only reference to
+such a module is missing from the workflow reference count, and the module's note says so.
 
 One thing it deliberately does not do is invent a module name. Where the arguments cannot single
 out one module, the row shows the implementation class and no module key.

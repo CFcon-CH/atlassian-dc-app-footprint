@@ -274,6 +274,28 @@ published in this repository.
 
 ### Fixed
 
+- **Jira: a disabled workflow module no longer leaves the report without a trace.** The module's
+  implementation class was also its type test, and `getImplementationClass()` returns null for a
+  disabled module. Measured on Jira 11.3.12 with one active app's workflow condition disabled,
+  `workflowModules` went from 4 to 3 with `readErrors` at 0 and no diagnostic. Read from the code,
+  a class-only entry of such a module was dropped silently and an app with only such modules fell
+  from Dormant to None.
+  - A workflow module is now recognised by its descriptor, and its enablement and class are read
+    once each. `workflowModules` includes disabled modules, with enabled, disabled and unknown
+    counts beside it.
+  - A disabled module without a class is an observation and raises no read error. An enabled or
+    unknown module without a class and a throwing getter report their own codes and do count, and
+    a throwing getter counts on a disabled module too. A failed `getModuleClass()` read, which
+    feeds the class index and the text scan, is no longer swallowed either.
+  - The capability gains `Disabled modules only` and `Unknown`. A positive entry still wins.
+  - A class-only position keeps an owner only if exactly one app read the class and no unread
+    module could contest it. A proven disabled module does not. Key, prefix and factory attribution
+    in `resolveOwner` are unchanged, so an entry carrying `full.module.key` keeps its owner.
+  - A position without an owner stays out of every app's numbers and is now counted
+    (`unattributedExtensionPoints`) and listed by class and reason. Because Jira's own functions
+    belong to no app, expect this number to be large on any instance.
+  - The report gains a **Workflow attribution** block, JSON gains `workflowAttribution`, and CSV
+    gains seven columns at its end. Existing columns keep their position and unit.
 - **WITHDRAWN in `4.10`, see the Withdrawn section above. The premise of this entry is
   disproven: the fault was a stale ScriptRunner endpoint registration, not a type that could
   not resolve, and the unchanged `4.8` loads and exports once the endpoint is re-created. The

@@ -8,8 +8,9 @@ no Jira on the classpath and no running instance.
 
 The classes free of every Jira type are `Fp`, `AppModuleInfo`, `ScreenPlacementInfo`,
 `CustomFieldFootprint`, `WorkflowSnapshot`, `WorkflowReference`, `ImpactPolicy`,
-`ProjectPartition`, `IssueTotals`, `ImpactDimension`, `ImpactAssessment`, `AppFootprint`,
-`ImpactAnalyzer`, `DecisionRead`, `ExportOutcome` and `PageExport`.
+`WorkflowExtension`, `WorkflowModuleRead`, `ProjectPartition`, `IssueTotals`, `ImpactDimension`,
+`ImpactAssessment`, `AppFootprint`, `ImpactAnalyzer`, `DecisionRead`, `ExportOutcome` and
+`PageExport`.
 
 ## What is covered
 
@@ -31,6 +32,24 @@ is duck-typed against fake descriptors, so it runs without Jira on the classpath
 An app registering workflow modules and configuring none of them is a different state from an
 app that cannot contribute one at all, and the tests keep them apart. A control that only asks
 whether the extension list is empty paints both the same, which is what the report used to do.
+
+### Disabled workflow modules
+
+A disabled workflow module returns null from `getImplementationClass()`, and that null used to be
+the type test, so the module left the report without a trace. The tests drive real descriptor
+classes through the read, the attribution and the report output.
+
+- A module is recognised by its declared getter. A descriptor without it, or with a getter of
+  another return type, is not read at all, and each of the two reads happens once.
+- Disabled without a class stays registered and raises no read error. Enabled without a class, an
+  unknown state and a throwing getter each report their own code, and a throwing getter is a read
+  error on a disabled module too. A control shows that `safeCall` cannot tell these apart.
+- Dormant, `Disabled modules only`, `Unknown` and the rule that a positive reference wins.
+- A disabled-only app does not contest a uniquely read class. An enabled module without a class, an
+  unknown state, a failed read and an unread module list do, and the position stays open with the
+  possible owners named. Key, prefix and factory attribution are held unchanged.
+- A position without an owner lands in no app and stays visible: exact count, reason, possible
+  owners and cut examples, in the HTML section, the JSON block and the last CSV columns.
 
 ### Attribution, and the two ways it goes wrong
 
@@ -138,7 +157,8 @@ confirm. That is precisely the defect the position logic replaced.
 Nothing that needs a running instance. That means the analysis against Jira itself, the
 application link call that writes the page, the search that finds spaces and parent pages,
 the move itself, the permission gate and both HTTP entry points. Test against a real
-instance before trusting a change to any of those.
+instance before trusting a change to any of those. The same goes for what a real disabled module
+answers: the fakes answer as the bytecode of jira-core 10.3.19 and 11.3.8 says it does.
 
 For the workflow walk specifically, the offline suite drives the descriptor fallback, not
 `JiraWorkflow.getAllActions()`, so the scope labels `Initial`, `Global` and `Common` come
@@ -191,6 +211,11 @@ resolve symbols, so a misspelled Jira method name passes it and still fails insi
 instance.
 
 ## Last recorded run
+
+2026-11-05: 700 assertions green, parse check green, on JDK 21 with Groovy 3.0.21. Red before the
+fix, with the shipped module read plugged into the new names: `workflowModules` 3 where 4 are
+registered, `None` for an app with only disabled modules, and a class-only position kept by its
+first class owner while a competitor stayed unread.
 
 2026-08-27: 533 assertions green, parse check green. Red-before-green measurements of the
 same run: eight position cases, where the create-only control refuses six moves and claims
