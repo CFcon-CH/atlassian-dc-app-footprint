@@ -305,6 +305,12 @@ chain and are never compared. On Data Center that chain runs in order, synchrono
 part of the transition, which is exactly the assumption that does not survive every move to
 another platform.
 
+Only a proven foreign owner counts. An entry of unknown owner behind a post function may be the
+app's own, so it claims nothing: the post function's `orderingStatus` is `UNKNOWN`, the entry
+counts in `followedByUnknown`, and the app's dependency count carries an asterisk as a lower bound.
+A proven foreign owner settles the answer as `YES` however many others stay unknown. A hidden
+app's position has an owner and counts as foreign.
+
 The walk runs for every workflow, independent of the text scan, and it costs no extra
 retrieval: it reads the descriptor graph the script already holds in memory.
 
@@ -369,9 +375,19 @@ class path may claim. Key and prefix attribution are not affected.
 
 An open position is in no app's numbers, and it no longer disappears. The summary carries
 `unattributedExtensionPoints`, and the **Workflow attribution** block lists one row per class and
-reason with an exact position count and a few examples. Expect a large number on any instance:
-Jira's own functions belong to no app and land here, as does the class of any app the chosen
-filters did not read. What this does not do is feed the impact level, which is measured from
+reason with an exact position count and a few examples.
+
+The filters decide which apps get a row, not which classes have an owner. Attribution reads the
+workflow modules of every installed plugin, whatever `includeSystem` and `includeDisabled` say, and
+those plugins compete under the same rules. A position owned by an app the filters do not list,
+such as Jira's own functions with `includeSystem=false`, is therefore neither open nor anyone
+else's. It counts in `extensionPointsOfHiddenApps`, and a listed app's numbers do not move. A gap in
+such an app stays visible in the block, marked as not listed, and a read failure there is a
+report-wide read error. Every walked position is in exactly one of three places: a listed app, a
+hidden app, or the unattributed count. `scan.pluginCensusMs` in JSON shows what reading the
+hidden plugins cost.
+
+What this does not do is feed the impact level, which is measured from
 fields and references. A count of possible owners is not a footprint. The limit runs the other
 way too: the text scan cannot search for a class it could not read, so a class-only reference to
 such a module is missing from the workflow reference count, and the module's note says so.

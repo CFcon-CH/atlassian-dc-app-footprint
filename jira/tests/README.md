@@ -24,7 +24,7 @@ is duck-typed against fake descriptors, so it runs without Jira on the classpath
   separate chains: entries that can never run in sequence are never compared.
 - Nested condition groups resolve recursively without double counting, and a common action
   referenced by several steps is reported once.
-- The ordering marker fires only for a post function with an entry from another provider
+- The ordering marker fires only for a post function with an entry from a proven other provider
   behind it in the same chain, and never for one that runs last.
 
 ### Installed but idle
@@ -50,6 +50,12 @@ classes through the read, the attribution and the report output.
   possible owners named. Key, prefix and factory attribution are held unchanged.
 - A position without an owner lands in no app and stays visible: exact count, reason, possible
   owners and cut examples, in the HTML section, the JSON block and the last CSV columns.
+- The report filters hide an owner, not its ownership: every plugin joins the index, a position of a
+  hidden app is neither open nor a listed app's, and a class in no plugin stays unattributed. Hidden
+  plugins compete under the same rules, their gaps stay visible, and a broken one cannot end the
+  report. Reading a hidden plugin asks for enablement only on its workflow modules.
+- An unknown owner behind a post function leaves the ordering answer open. Only a proven foreign
+  owner makes a dependency, and a control keeps the old rule that counted unknown as foreign.
 
 ### Attribution, and the two ways it goes wrong
 
@@ -212,10 +218,11 @@ instance.
 
 ## Last recorded run
 
-2026-11-05: 700 assertions green, parse check green, on JDK 21 with Groovy 3.0.21. Red before the
+2026-11-05: 759 assertions green, parse check green, on JDK 21 with Groovy 3.0.21. Red before the
 fix, with the shipped module read plugged into the new names: `workflowModules` 3 where 4 are
-registered, `None` for an app with only disabled modules, and a class-only position kept by its
-first class owner while a competitor stayed unread.
+registered, `None` for an app with only disabled modules, a class-only position kept by its first
+class owner while a competitor stayed unread, no owner for a position of a filtered plugin, and an
+ordering dependency claimed from an unknown owner.
 
 2026-08-27: 533 assertions green, parse check green. Red-before-green measurements of the
 same run: eight position cases, where the create-only control refuses six moves and claims

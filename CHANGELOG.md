@@ -292,10 +292,19 @@ published in this repository.
     module could contest it. A proven disabled module does not. Key, prefix and factory attribution
     in `resolveOwner` are unchanged, so an entry carrying `full.module.key` keeps its owner.
   - A position without an owner stays out of every app's numbers and is now counted
-    (`unattributedExtensionPoints`) and listed by class and reason. Because Jira's own functions
-    belong to no app, expect this number to be large on any instance.
+    (`unattributedExtensionPoints`) and listed by class and reason.
+  - The filters only decide which apps get a row. Attribution reads the workflow modules of every
+    installed plugin, and those plugins compete under the same rules. A position owned by an app
+    the filters do not list counts in `extensionPointsOfHiddenApps`, neither as unattributed nor
+    for a listed app. Measured on Jira 11.3.12 before this change, 274 positions of Jira's own
+    functions read as having no proven owner with `includeSystem=false`, and none with
+    `includeSystem=true`. A gap in a hidden app stays visible, and JSON reports the cost of the
+    extra read as `scan.pluginCensusMs`.
+  - An ordering dependency now needs a proven foreign owner. An entry of unknown owner behind a post
+    function used to count as foreign; it now gives `orderingStatus` `UNKNOWN`, `followedByUnknown`
+    and a lower-bound mark on the count, because such an entry may be the app's own.
   - The report gains a **Workflow attribution** block, JSON gains `workflowAttribution`, and CSV
-    gains seven columns at its end. Existing columns keep their position and unit.
+    gains ten columns at its end. Existing columns keep their position and unit.
 - **WITHDRAWN in `4.10`, see the Withdrawn section above. The premise of this entry is
   disproven: the fault was a stale ScriptRunner endpoint registration, not a type that could
   not resolve, and the unchanged `4.8` loads and exports once the endpoint is re-created. The

@@ -915,6 +915,78 @@ class Fp {
         }
     }
 
+    /* A module class feeds the class index and the text scan, so losing one limits both. */
+    static String readModuleClass(Object descriptor, String completeKey, List<String> sink) {
+        try {
+            Class<?> moduleClass = (Class<?>) descriptor.getModuleClass()
+            return moduleClass == null ? null : moduleClass.getName()
+        } catch (Throwable error) {
+            note(sink, "module class " + completeKey, error)
+            return null
+        }
+    }
+
+    /*
+     * A plugin the report filters do not list still owns its modules. The filters decide
+     * which apps get a row, not which classes have an owner: Jira's own functions are
+     * class-only entries of system plugins, and leaving those out of the index made every
+     * one of them read as having no proven owner.
+     *
+     * So every plugin joins the owner index under the same rules, without a row or a
+     * number of its own. Only what attribution needs is read: the enablement and the class
+     * of a workflow module, and the module class of the weaker index. A failure lands in
+     * the report-wide diagnostics, because no app card exists to carry it, and it is caught
+     * for the whole plugin, because this reads plugins the report never touched before and
+     * must not be able to end it.
+     */
+    static AppFootprint readHiddenPlugin(Object plugin, Object pluginAccessor,
+                                         Map<String, String> moduleClassOwners,
+                                         Collection<WorkflowModuleRead> reads,
+                                         Collection<String> unreadModuleLists, List<String> sink) {
+        String pluginKey = plugin.getKey()
+        AppFootprint hidden = new AppFootprint(pluginKey: pluginKey, displayName: pluginKey, hiddenByFilter: true)
+        try {
+            hidden.displayName = plugin.getName() ?: pluginKey
+            for (Object descriptor : plugin.getModuleDescriptors()) {
+                String moduleKey = descriptor.getKey()
+                String completeKey = descriptor.getCompleteKey()
+                String moduleClass = readModuleClass(descriptor, completeKey, hidden.diagnostics)
+                if (moduleClass != null && isAppClassName(moduleClass)) {
+                    moduleClassOwners.putIfAbsent(moduleClass, pluginKey)
+                }
+                if (isWorkflowModule(descriptor)) {
+                    Boolean enabled = readModuleEnablement(pluginAccessor, completeKey, hidden.diagnostics)
+                    WorkflowModuleRead read = readWorkflowModule(descriptor, pluginKey, moduleKey, completeKey, enabled)
+                    reads.add(read)
+                    hidden.recordWorkflowModule(read)
+                }
+            }
+        } catch (Throwable error) {
+            note(hidden.diagnostics, "module descriptors", error)
+            hidden.workflowModuleListUnread = true
+            unreadModuleLists.add(pluginKey)
+        }
+        for (String entry : hidden.diagnostics) {
+            sink.add("hidden app " + pluginKey + ": " + entry)
+        }
+        return hidden
+    }
+
+    /* A position whose owner has no row here. It is neither open nor any listed app's. */
+    static int hiddenOwnerPositions(Collection<WorkflowExtension> extensions, Collection<AppFootprint> apps) {
+        Set<String> listed = new HashSet<String>()
+        for (AppFootprint app : apps) {
+            listed.add(app.pluginKey)
+        }
+        int count = 0
+        for (WorkflowExtension extension : extensions) {
+            if (extension.ownerPluginKey != null && !listed.contains(extension.ownerPluginKey)) {
+                count++
+            }
+        }
+        return count
+    }
+
     /*
      * Reads the class exactly once, and keeps a getter that answered null apart from
      * one that threw, which safeCall cannot. Null for anything but a workflow module.
@@ -1033,9 +1105,8 @@ class Fp {
         }
     }
 
-    /* Jira's own functions land here on every instance, thousands of positions of a few
-     * classes, so one row per class and reason is what stays readable. The count is exact;
-     * only the examples are cut, and the result says so. */
+    /* One row per class and reason. The count is exact; only the examples are cut, and the
+     * result says so. */
     static final int OPEN_POSITION_EXAMPLES = 5
 
     static List<Map<String, Object>> groupOpenPositions(Collection<WorkflowExtension> extensions) {
@@ -1114,14 +1185,20 @@ class Fp {
     /* New columns only ever go at the end, so that every existing one keeps its position. */
     static final String WORKFLOW_CSV_COLUMNS =
         "workflowModulesEnabled,workflowModulesDisabled,workflowModulesUnknown,workflowModuleDiagnostics," +
-        "openWorkflowPositions,unattributedExtensionPoints,unattributedExtensionPointReasons"
+        "openWorkflowPositions,unattributedExtensionPoints,unattributedExtensionPointReasons," +
+        "extensionPointsOfHiddenApps,hiddenWorkflowModuleDiagnostics,orderingUnknown"
 
-    /* The two positional totals repeat in every row: this format has no summary line. */
-    static String workflowCsvCells(AppFootprint app, List<Map<String, Object>> groups) {
+    static String moduleNotesCell(Collection<AppFootprint> apps) {
         List<String> notes = new ArrayList<String>()
-        for (Map<String, Object> row : app.workflowModuleDiagnostics()) {
+        for (Map<String, Object> row : workflowModuleDiagnostics(apps)) {
             notes.add(row.module + " " + row.code)
         }
+        return csv(String.join(" | ", notes))
+    }
+
+    /* The report-wide totals repeat in every row: this format has no summary line. */
+    static String workflowCsvCells(AppFootprint app, List<Map<String, Object>> groups,
+                                   Collection<AppFootprint> hiddenApps, int hiddenPositions) {
         Map<String, Integer> reasons = new TreeMap<String, Integer>()
         for (Map<String, Object> group : groups) {
             reasons.merge((String) group.reason, (Integer) group.positions, { Integer a, Integer b -> a + b })
@@ -1134,8 +1211,9 @@ class Fp {
             reasonCells.add(WALK_INCOMPLETE)
         }
         return [app.workflowModulesEnabled, app.workflowModulesDisabled, app.workflowModulesUnknown,
-                csv(String.join(" | ", notes)), app.openWorkflowPositions, openPositionTotal(groups),
-                csv(String.join(" | ", reasonCells))].join(",")
+                moduleNotesCell([app]), app.openWorkflowPositions, openPositionTotal(groups),
+                csv(String.join(" | ", reasonCells)), hiddenPositions, moduleNotesCell(hiddenApps),
+                app.orderingUnknownCount].join(",")
     }
 
     /* ---- what the report says about it ---------------------------------------- */
@@ -1182,6 +1260,13 @@ class Fp {
         boolean lowerBound = app.openWorkflowPositions > 0 || app.workflowWalkIncomplete
         return html(number(app.extensionPointCount, locale)) + (lowerBound ?
             '<span class="warn" title="Incomplete, lower bound">&#42;</span>' : "")
+    }
+
+    static String orderingCell(AppFootprint app, Locale locale) {
+        String count = html(number(app.orderingRiskCount, locale))
+        return (app.orderingRiskCount > 0 ? '<span class="warn">' + count + '</span>' : count) +
+            (app.orderingUnknownCount > 0 ? '<span class="warn" title="A post function of this app has an entry ' +
+                'of unknown owner behind it, this is a lower bound">&#42;</span>' : "")
     }
 
     static String extensionPointLabel(AppFootprint app, Locale locale) {
@@ -1252,7 +1337,9 @@ class Fp {
                 .append(' workflow module note(s)</summary>\n')
             tableHead(out, ["App", "Module", "State", "Code", "Reason"])
             for (Map<String, Object> note : notes) {
-                tableRow(out, [note.appName, note.module, note.state, note.code, note.reason])
+                tableRow(out, [String.valueOf(note.appName) +
+                    (note.hidden ? " (not listed by the current filters)" : ""),
+                    note.module, note.state, note.code, note.reason])
             }
             tableFoot(out)
             out.append('    </details>\n')
@@ -1261,9 +1348,8 @@ class Fp {
             out.append('    <details>\n        <summary>').append(html(number(openPositionTotal(groups), locale)))
                 .append(' workflow position(s) without an owner')
                 .append(walkComplete ? '' : ', a lower bound because a workflow could not be walked')
-                .append('</summary>\n        <p>These positions are in no app\'s numbers. Jira\'s own functions ')
-                .append('belong to no app and land here, as does the class of any app this scan did not read. ')
-                .append('Where an app could be behind a position, it is named.</p>\n')
+                .append('</summary>\n        <p>These positions are in no app\'s numbers: no installed plugin ')
+                .append('was proven to own them. Where an app could be behind a position, it is named.</p>\n')
             tableHead(out, ["Class or key", "Positions", "Kinds", "Workflows", "Reason",
                             "Possible owners", "Possible, module disabled", "Examples"])
             for (Map<String, Object> group : groups) {
@@ -1516,6 +1602,16 @@ class Fp {
      * Data Center has to reason about. Entries from separate conditional
      * branches never share a chain, so they are never compared.
      */
+    /*
+     * Only a proven foreign owner makes a dependency. An entry of unknown owner may be the
+     * app's own, so it proves nothing either way: the answer stays open rather than yes,
+     * and a proven one settles it however many others stay unknown. Same terms as Scalpel.
+     */
+    static final String ORDERING_YES = "YES"
+    static final String ORDERING_NO = "NO"
+    static final String ORDERING_UNKNOWN = "UNKNOWN"
+    static final String ORDERING_NOT_APPLICABLE = "NOT_APPLICABLE"
+
     static void markOrdering(List<WorkflowExtension> extensions) {
         if (extensions == null || extensions.isEmpty()) {
             return
@@ -1540,14 +1636,21 @@ class Fp {
                 WorkflowExtension current = bucket.get(index)
                 current.followedBy = size - index - 1
                 int foreign = 0
+                int unknown = 0
                 for (int later = index + 1; later < size; later++) {
                     String otherOwner = bucket.get(later).ownerPluginKey
-                    if (otherOwner == null || otherOwner != current.ownerPluginKey) {
+                    if (current.ownerPluginKey == null || otherOwner == null) {
+                        unknown++
+                    } else if (otherOwner != current.ownerPluginKey) {
                         foreign++
                     }
                 }
                 current.followedByOther = foreign
-                current.orderingRisk = KIND_POST_FUNCTION == current.kind && foreign > 0
+                current.followedByUnknown = unknown
+                boolean postFunction = KIND_POST_FUNCTION == current.kind
+                current.orderingRisk = postFunction && foreign > 0
+                current.orderingStatus = !postFunction ? ORDERING_NOT_APPLICABLE :
+                    (foreign > 0 ? ORDERING_YES : (unknown > 0 ? ORDERING_UNKNOWN : ORDERING_NO))
             }
         }
     }
@@ -1832,10 +1935,12 @@ class WorkflowExtension {
     /* argument values other than class.name and full.module.key */
     List<String> identity = new ArrayList<String>()
 
-    /* entries behind this one in the same chain, and how many are foreign */
+    /* entries behind this one in the same chain, how many are proven foreign, how many unknown */
     int followedBy
     int followedByOther
+    int followedByUnknown
     boolean orderingRisk
+    String orderingStatus
 
     /* set when no owner could be proven: why, and who could still be behind it */
     String openReason
@@ -1862,7 +1967,9 @@ class WorkflowExtension {
             attribution: attribution,
             followedBy: followedBy,
             followedByOther: followedByOther,
-            orderingRisk: orderingRisk
+            followedByUnknown: followedByUnknown,
+            orderingRisk: orderingRisk,
+            orderingStatus: orderingStatus
         ] as LinkedHashMap
     }
 }
@@ -2168,6 +2275,7 @@ class AppFootprint {
     List<String> workflowModuleKeys = new ArrayList<String>()
     List<WorkflowModuleRead> workflowModuleReads = new ArrayList<WorkflowModuleRead>()
     boolean workflowModuleListUnread
+    boolean hiddenByFilter
     int openWorkflowPositions
     boolean workflowWalkIncomplete
     List<String> diagnostics = new ArrayList<String>()
@@ -2199,6 +2307,7 @@ class AppFootprint {
     int extensionWorkflowCount
     int extensionTransitionCount
     int orderingRiskCount
+    int orderingUnknownCount
     int workflowModulesEnabled
     int workflowModulesDisabled
     int workflowModulesUnknown
@@ -2251,7 +2360,7 @@ class AppFootprint {
         for (WorkflowModuleRead read : workflowModuleReads) {
             for (String code : read.codes()) {
                 List<String> issue = Fp.MODULE_ISSUES.get(code)
-                rows.add([app: pluginKey, appName: displayName, module: read.completeKey,
+                rows.add([app: pluginKey, appName: displayName, hidden: hiddenByFilter, module: read.completeKey,
                           state: Fp.moduleStateLabel(read.enabled), code: code, kind: issue.get(0),
                           reason: issue.get(1) + (code == Fp.MODULE_IMPLEMENTATION_READ_FAILED ?
                               " " + read.failure : "")] as LinkedHashMap)
@@ -2379,6 +2488,7 @@ class AppFootprint {
         validatorCount = 0
         preFunctionCount = 0
         orderingRiskCount = 0
+        orderingUnknownCount = 0
         Set<String> extensionWorkflows = new TreeSet<String>()
         Set<String> extensionTransitions = new TreeSet<String>()
         for (WorkflowExtension extension : workflowExtensions) {
@@ -2393,6 +2503,9 @@ class AppFootprint {
             }
             if (extension.orderingRisk) {
                 orderingRiskCount++
+            }
+            if (Fp.ORDERING_UNKNOWN == extension.orderingStatus) {
+                orderingUnknownCount++
             }
             if (extension.workflowName != null) {
                 extensionWorkflows.add(extension.workflowName)
@@ -2675,6 +2788,7 @@ class AppFootprint {
                 extensionWorkflows: extensionWorkflowCount,
                 extensionTransitions: extensionTransitionCount,
                 orderingRisks: orderingRiskCount,
+                orderingUnknown: orderingUnknownCount,
                 customFields: fieldMaps,
                 workflows: workflowMaps,
                 workflowExtensions: extensionMaps
@@ -4414,18 +4528,10 @@ appFootprint(
 
             module.enabled = Fp.readModuleEnablement(pluginAccessor, module.completeKey, app.diagnostics)
 
-            try {
-                Class<?> moduleClazz = descriptor.getModuleClass()
-                if (moduleClazz != null) {
-                    module.moduleClass = moduleClazz.getName()
-                    if (!module.moduleClass.startsWith("java.") && !module.moduleClass.startsWith("groovy.")) {
-                        moduleClasses.add(module.moduleClass)
-                        moduleClassOwners.putIfAbsent(module.moduleClass, app.pluginKey)
-                    }
-                }
-            } catch (Throwable error) {
-                module.moduleClass = null
-                Fp.note(app.diagnostics, "module class " + module.completeKey, error)
+            module.moduleClass = Fp.readModuleClass(descriptor, module.completeKey, app.diagnostics)
+            if (module.moduleClass != null && Fp.isAppClassName(module.moduleClass)) {
+                moduleClasses.add(module.moduleClass)
+                moduleClassOwners.putIfAbsent(module.moduleClass, app.pluginKey)
             }
 
             /*
@@ -4839,14 +4945,26 @@ appFootprint(
      * The plugin key universe deliberately comes from every installed plugin,
      * not from the filtered candidate list. A plugin excluded by includeSystem
      * or includeDisabled still owns its modules, and leaving its key out would
-     * let a shorter key that happens to prefix it claim them.
+     * let a shorter key that happens to prefix it claim them. The same goes for
+     * its classes, so the owner index is completed here as well. The filters
+     * still only decide which apps get a row.
      */
     Set<String> attributionPluginKeys = new LinkedHashSet<String>()
+    Set<String> listedPluginKeys = new HashSet<String>()
+    for (AppFootprint app : apps) {
+        listedPluginKeys.add(app.pluginKey)
+    }
+    List<AppFootprint> hiddenApps = new ArrayList<AppFootprint>()
+    long pluginCensusStarted = System.currentTimeMillis()
     try {
         for (Plugin plugin : pluginAccessor.getPlugins()) {
             String key = plugin.getKey()
             if (key != null && !key.isEmpty()) {
                 attributionPluginKeys.add(key)
+                if (!listedPluginKeys.contains(key)) {
+                    hiddenApps.add(Fp.readHiddenPlugin(plugin, pluginAccessor, moduleClassOwners,
+                        allWorkflowModuleReads, unreadModuleLists, globalDiagnostics))
+                }
             }
         }
     } catch (Exception error) {
@@ -4856,12 +4974,16 @@ appFootprint(
             attributionPluginKeys.add(app.pluginKey)
         }
     }
+    long pluginCensusMs = System.currentTimeMillis() - pluginCensusStarted
 
     Fp.attributeExtensions(allWorkflowExtensions, attributionPluginKeys, moduleClassOwners,
         allWorkflowModuleReads, unreadModuleLists)
     Fp.markOpenPositions(apps, allWorkflowExtensions, workflowExtensionWalkComplete)
     List<Map<String, Object>> openPositionGroups = Fp.groupOpenPositions(allWorkflowExtensions)
     int unattributedExtensionPoints = Fp.openPositionTotal(openPositionGroups)
+    int extensionPointsOfHiddenApps = Fp.hiddenOwnerPositions(allWorkflowExtensions, apps)
+    List<AppFootprint> attributionApps = new ArrayList<AppFootprint>(apps)
+    attributionApps.addAll(hiddenApps)
 
     Fp.markOrdering(allWorkflowExtensions)
 
@@ -4996,6 +5118,7 @@ appFootprint(
     int totalWorkflowModulesUnknown = 0
     int totalPostFunctions = 0
     int totalOrderingRisks = 0
+    int totalOrderingUnknown = 0
     int totalDiagnostics = globalDiagnostics.size()
     int totalObservations = globalObservations.size()
     Set<String> allImpactedProjects = new TreeSet<String>()
@@ -5057,6 +5180,7 @@ appFootprint(
         totalWorkflowModulesUnknown += app.workflowModulesUnknown
         totalPostFunctions += app.postFunctionCount
         totalOrderingRisks += app.orderingRiskCount
+        totalOrderingUnknown += app.orderingUnknownCount
         totalDiagnostics += app.diagnosticCount
     }
 
@@ -5209,8 +5333,10 @@ appFootprint(
                 extensionPoints: totalExtensionPoints,
                 postFunctions: totalPostFunctions,
                 orderingRisks: totalOrderingRisks,
+                orderingUnknown: totalOrderingUnknown,
                 extensionWalkComplete: workflowExtensionWalkComplete,
                 unattributedExtensionPoints: unattributedExtensionPoints,
+                extensionPointsOfHiddenApps: extensionPointsOfHiddenApps,
                 workflowModules: totalWorkflowModules,
                 workflowModulesEnabled: totalWorkflowModulesEnabled,
                 workflowModulesDisabled: totalWorkflowModulesDisabled,
@@ -5255,11 +5381,12 @@ appFootprint(
                 globalDistinctTokens: globalTokens.size(),
                 screenSchemesWalked: screenSchemesWalked,
                 screenSchemesTotal: screenSchemesTotal,
-                screenReachTruncated: screenReachTruncated
+                screenReachTruncated: screenReachTruncated,
+                pluginCensusMs: pluginCensusMs
             ] as LinkedHashMap,
             diagnostics: globalDiagnostics,
             observations: globalObservations,
-            workflowAttribution: Fp.workflowAttributionMap(apps, openPositionGroups, workflowExtensionWalkComplete),
+            workflowAttribution: Fp.workflowAttributionMap(attributionApps, openPositionGroups, workflowExtensionWalkComplete),
             apps: appMaps
         ] as LinkedHashMap
 
@@ -5359,7 +5486,7 @@ appFootprint(
             csv.append(app.servletModules).append(",")
             csv.append(app.detected).append(",")
             csv.append(app.diagnosticCount).append(",")
-            csv.append(Fp.workflowCsvCells(app, openPositionGroups)).append("\n")
+            csv.append(Fp.workflowCsvCells(app, openPositionGroups, hiddenApps, extensionPointsOfHiddenApps)).append("\n")
         }
 
         return responseClass
@@ -5831,7 +5958,7 @@ summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--blue)
         <div class="summary-label">App Extension Points</div>
     </div>
     <div class="summary-card">
-        <div class="summary-value">${totalOrderingRisks > 0 ? '<span class="warn">' + num(totalOrderingRisks) + '</span>' : num(totalOrderingRisks)}</div>
+        <div class="summary-value">${totalOrderingRisks > 0 ? '<span class="warn">' + num(totalOrderingRisks) + '</span>' : num(totalOrderingRisks)}${totalOrderingUnknown > 0 ? '<span class="warn" title="At least one post function has an entry of unknown owner behind it, this is a lower bound">&#42;</span>' : ""}</div>
         <div class="summary-label">Ordering Dependencies</div>
     </div>
     <div class="summary-card">
@@ -5841,6 +5968,10 @@ summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--blue)
     <div class="summary-card">
         <div class="summary-value">${num(unattributedExtensionPoints)}${workflowExtensionWalkComplete ? "" : '<span class="warn" title="At least one workflow could not be walked, this is a lower bound">&#42;</span>'}</div>
         <div class="summary-label">Workflow Positions Without Owner</div>
+    </div>
+    <div class="summary-card">
+        <div class="summary-value">${num(extensionPointsOfHiddenApps)}</div>
+        <div class="summary-label" title="Positions owned by an app the current filters do not list, such as Jira's own system apps. They belong to that app and to no app below.">Extension Points of Hidden Apps</div>
     </div>
     <div class="summary-card">
         <div class="summary-value">${includeReach ? num(allActiveImpactedSpaces.size()) : '<span class="muted">off</span>'}</div>
@@ -5920,7 +6051,7 @@ summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--blue)
 """)
     }
 
-    html.append(Fp.workflowAttributionHtml(apps, openPositionGroups, workflowExtensionWalkComplete, numberLocale))
+    html.append(Fp.workflowAttributionHtml(attributionApps, openPositionGroups, workflowExtensionWalkComplete, numberLocale))
 
     /* ---- Confluence page export card --------------------------------------- */
 
@@ -6148,7 +6279,7 @@ summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--blue)
         <div class="metric-label">Extension Points${Fp.extensionPointLabel(app, numberLocale)}</div>
     </div>
     <div class="metric">
-        <div class="metric-value">${app.orderingRiskCount > 0 ? '<span class="warn">' + num(app.orderingRiskCount) + '</span>' : num(app.orderingRiskCount)}</div>
+        <div class="metric-value">${Fp.orderingCell(app, numberLocale)}</div>
         <div class="metric-label">Ordering Dependencies</div>
     </div>
     <div class="metric impact">
@@ -6448,7 +6579,7 @@ summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--blue)
         <div><span class="muted">Pre functions</span> <strong>${num(app.preFunctionCount)}</strong></div>
         <div><span class="muted">Workflows</span> <strong>${num(app.extensionWorkflowCount)}</strong></div>
         <div><span class="muted">Transitions</span> <strong>${num(app.extensionTransitionCount)}</strong></div>
-        <div><span class="muted">Ordering dependencies</span> <strong class="${app.orderingRiskCount > 0 ? 'warn' : ''}">${num(app.orderingRiskCount)}</strong></div>
+        <div><span class="muted">Ordering dependencies</span> <strong>${Fp.orderingCell(app, numberLocale)}</strong></div>
     </div>
     <div class="table-wrap">
     <table class="footprint-table">
@@ -6489,7 +6620,10 @@ summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--blue)
                 String behindCell = extension.orderingRisk ?
                     "<span class=\"warn\" title=\"Another provider runs after this post function in the same chain\">" +
                         num(extension.followedByOther) + " of " + num(extension.followedBy) + "</span>" :
-                    num(extension.followedBy)
+                    (Fp.ORDERING_UNKNOWN == extension.orderingStatus ?
+                        "<span class=\"warn\" title=\"An entry of unknown owner runs after this post function, so a dependency is neither proven nor ruled out\">" +
+                            num(extension.followedBy) + "&#42;</span>" :
+                        num(extension.followedBy))
 
                 html.append("""            <tr>
                 <td>${workflowCell}</td>
