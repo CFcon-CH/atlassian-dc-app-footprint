@@ -274,7 +274,7 @@ published in this repository.
 
 ### Fixed
 
-- **Jira: a disabled workflow module no longer leaves the report without a trace.** The module's
+- **Jira: a disabled workflow module no longer leaves the report without a trace** (`3.12`, OP-1602). The module's
   implementation class was also its type test, and `getImplementationClass()` returns null for a
   disabled module. Measured on Jira 11.3.12 with one active app's workflow condition disabled,
   `workflowModules` went from 4 to 3 with `readErrors` at 0 and no diagnostic. Read from the code,
