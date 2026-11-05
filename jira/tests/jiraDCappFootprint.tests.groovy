@@ -2223,6 +2223,9 @@ class Op1602ConditionA { }
 class Op1602ConditionB { }
 class Op1602ConditionC { }
 
+/* A closure of its own: the script body already sits close to the JVM's 64 KB method limit. */
+def op1602Section = {
+
 List<String> op1602SetupFailures = []
 def soft = { String step, Closure body ->
     try {
@@ -2244,32 +2247,32 @@ def t = { String name, Closure actual, Object expected ->
     }
 }
 def newApp = { String key -> new AppFootprint(pluginKey: key, displayName: key, enabled: true) }
-def register = { AppFootprint app, List reads, String moduleKey, Boolean enabled,
+def register = { AppFootprint target, List reads, String moduleKey, Boolean enabled,
                  Class impl = null, Throwable failure = null ->
     Object descriptor = new FakeWorkflowModule(impl: impl, failure: failure)
     return soft("register " + moduleKey) {
-        Object read = Fp.readWorkflowModule(descriptor, app.pluginKey, moduleKey,
-            app.pluginKey + ":" + moduleKey, enabled)
+        Object read = Fp.readWorkflowModule(descriptor, target.pluginKey, moduleKey,
+            target.pluginKey + ":" + moduleKey, enabled)
         reads.add(read)
-        app.recordWorkflowModule(read)
+        target.recordWorkflowModule(read)
         return read
     }
 }
 def scan = { List apps, List reads, List extensions, Map factory = [:],
              Set unreadLists = new HashSet(), boolean walkComplete = true ->
-    List<String> keys = apps.collect { it.pluginKey }
+    List<String> pluginKeys = apps.collect { it.pluginKey }
     soft("attribute") {
-        Fp.attributeExtensions(extensions, keys, factory, reads, unreadLists)
+        Fp.attributeExtensions(extensions, pluginKeys, factory, reads, unreadLists)
     }
-    for (AppFootprint app : apps) {
-        app.workflowExtensions.addAll(extensions.findAll { it.ownerPluginKey == app.pluginKey })
-        if (unreadLists.contains(app.pluginKey)) {
-            soft("unread list") { app.workflowModuleListUnread = true }
+    for (AppFootprint target : apps) {
+        target.workflowExtensions.addAll(extensions.findAll { it.ownerPluginKey == target.pluginKey })
+        if (unreadLists.contains(target.pluginKey)) {
+            soft("unread list") { target.workflowModuleListUnread = true }
         }
     }
     soft("open positions") { Fp.markOpenPositions(apps, extensions, walkComplete) }
-    for (AppFootprint app : apps) {
-        app.finish()
+    for (AppFootprint target : apps) {
+        target.finish()
     }
 }
 def classOnly = { Class impl -> new WorkflowExtension(kind: Fp.KIND_CONDITION,
@@ -2653,7 +2656,8 @@ t("an entry listing is not cut when it fits",
 
 List<WorkflowExtension> manyOrphans = (1..40).collect { int index ->
     new WorkflowExtension(kind: Fp.KIND_POST_FUNCTION, workflowName: "WF " + index,
-        className: "com.acme.gone.Function", openReason: "OWNER_NOT_PROVEN") }
+        className: "com.acme.gone.Function") }
+soft("open reason") { manyOrphans.each { it.openReason = "OWNER_NOT_PROVEN" } }
 t("a long list keeps its exact count",
     { Fp.groupOpenPositions(manyOrphans)[0].positions }, 40)
 t("cuts its examples", { Fp.groupOpenPositions(manyOrphans)[0].examples.size() < 40 }, true)
@@ -2759,6 +2763,9 @@ ok("the instance summary counts the unknown verdicts apart",
     endpointText.contains('workflowCapabilityDisabledOnlyApps: totalDisabledOnlyWorkflowApps'))
 
 ok("no fixture step failed: " + op1602SetupFailures, op1602SetupFailures.isEmpty())
+
+}
+op1602Section.call()
 
 /* ---- result --------------------------------------------------------------- */
 
