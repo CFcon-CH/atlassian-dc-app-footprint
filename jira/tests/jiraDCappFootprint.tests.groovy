@@ -2163,6 +2163,603 @@ ok("summary cards show the total when the split is hidden",
 ok("a disabled split is not overwritten by the total state",
     endpointText.contains('if (archivedFieldScanState == Fp.DISABLED) {'))
 
+/* ---- OP-1602: a disabled workflow module is still a registered module ------ */
+
+/*
+ * Measured on Jira 11.3.12 with one active app's workflow condition disabled:
+ * workflowModules went from 4 to 3, readErrors stayed 0 and no diagnostic said why.
+ * Bytecode of jira-core 10.3.19 and 11.3.8: getImplementationClass() only reads a
+ * field, enabled() sets it, disabled() clears it. A null from that getter is therefore
+ * the ordinary state of a disabled module and tells nothing about whether the module
+ * exists, so it cannot be the type test as well.
+ *
+ * The descriptors are real classes rather than Expandos on purpose: the recognition
+ * reads the declared method, and an Expando closure is not one.
+ */
+class FakeWorkflowModule {
+    Class impl
+    Throwable failure
+    int reads = 0
+    Class getImplementationClass() {
+        reads++
+        if (failure != null) {
+            throw failure
+        }
+        return impl
+    }
+}
+
+class FakeWebResourceModule {
+    int reads = 0
+    Class getModuleClass() {
+        reads++
+        return String
+    }
+}
+
+/* Same name, wrong shape: an unrelated descriptor answering with something else. */
+class FakeLookalikeModule {
+    int reads = 0
+    String getImplementationClass() {
+        reads++
+        return "com.acme.NotAClass"
+    }
+}
+
+class FakeEnablementSource {
+    Object answer
+    int reads = 0
+    boolean isPluginModuleEnabled(String completeKey) {
+        reads++
+        if (answer instanceof Throwable) {
+            throw (Throwable) answer
+        }
+        return (boolean) answer
+    }
+}
+
+/* Probes for the classes below. Module implementation classes only need distinct names. */
+class Op1602ConditionA { }
+class Op1602ConditionB { }
+class Op1602ConditionC { }
+
+List<String> op1602SetupFailures = []
+def soft = { String step, Closure body ->
+    try {
+        return body.call()
+    } catch (Throwable error) {
+        op1602SetupFailures << (step + ": " + error.getClass().getSimpleName())
+        return null
+    }
+}
+/* One assertion, isolated, so a missing member fails that assertion and nothing else. */
+def t = { String name, Closure actual, Object expected ->
+    try {
+        check(name, actual.call(), expected)
+    } catch (Throwable error) {
+        failed++
+        String message = String.valueOf(error.getMessage())
+        failures << (name + "\n     threw   : " + error.getClass().getSimpleName() + ": " +
+            message.substring(0, Math.min(120, message.length())))
+    }
+}
+def newApp = { String key -> new AppFootprint(pluginKey: key, displayName: key, enabled: true) }
+def register = { AppFootprint app, List reads, String moduleKey, Boolean enabled,
+                 Class impl = null, Throwable failure = null ->
+    Object descriptor = new FakeWorkflowModule(impl: impl, failure: failure)
+    return soft("register " + moduleKey) {
+        Object read = Fp.readWorkflowModule(descriptor, app.pluginKey, moduleKey,
+            app.pluginKey + ":" + moduleKey, enabled)
+        reads.add(read)
+        app.recordWorkflowModule(read)
+        return read
+    }
+}
+def scan = { List apps, List reads, List extensions, Map factory = [:],
+             Set unreadLists = new HashSet(), boolean walkComplete = true ->
+    List<String> keys = apps.collect { it.pluginKey }
+    soft("attribute") {
+        Fp.attributeExtensions(extensions, keys, factory, reads, unreadLists)
+    }
+    for (AppFootprint app : apps) {
+        app.workflowExtensions.addAll(extensions.findAll { it.ownerPluginKey == app.pluginKey })
+        if (unreadLists.contains(app.pluginKey)) {
+            soft("unread list") { app.workflowModuleListUnread = true }
+        }
+    }
+    soft("open positions") { Fp.markOpenPositions(apps, extensions, walkComplete) }
+    for (AppFootprint app : apps) {
+        app.finish()
+    }
+}
+def classOnly = { Class impl -> new WorkflowExtension(kind: Fp.KIND_CONDITION,
+    workflowName: "WF", scope: "Transition", transitionId: 11, transitionName: "Start",
+    chain: "conditions", position: 1, chainLength: 1, className: impl.getName()) }
+
+/* -- the measured case: four modules, one disabled ---------------------------- */
+
+List op1602Reads = []
+AppFootprint measuredApp = newApp("com.acme.app")
+register(measuredApp, op1602Reads, "function-a", Boolean.TRUE, Op1602ConditionA)
+register(measuredApp, op1602Reads, "function-b", Boolean.TRUE, Op1602ConditionB)
+register(measuredApp, op1602Reads, "validator-c", Boolean.TRUE, Op1602ConditionC)
+Object measuredDisabled = register(measuredApp, op1602Reads, "condition-d", Boolean.FALSE)
+scan([measuredApp], op1602Reads, [])
+t("a disabled module without a class stays registered: 4, not 3",
+    { measuredApp.workflowModuleKeys.size() }, 4)
+t("and it is named among the module keys",
+    { measuredApp.workflowModuleKeys.contains("condition-d") }, true)
+t("the enabled modules are counted apart", { measuredApp.workflowModulesEnabled }, 3)
+t("the disabled module is counted apart", { measuredApp.workflowModulesDisabled }, 1)
+t("no module is of unknown state", { measuredApp.workflowModulesUnknown }, 0)
+t("a disabled module is an observation with its own code",
+    { measuredDisabled.codes() }, ["DISABLED_MODULE_CLASS_UNAVAILABLE"])
+t("a disabled module raises no read error", { measuredApp.diagnosticCount }, 0)
+t("a mixed app without configuration stays dormant",
+    { measuredApp.workflowCapability }, "Dormant")
+t("the JSON footprint counts the registered modules",
+    { measuredApp.asMap(false).footprint.workflowModules }, 4)
+t("the JSON footprint carries the enabled count",
+    { measuredApp.asMap(false).footprint.workflowModulesEnabled }, 3)
+t("the JSON footprint carries the disabled count",
+    { measuredApp.asMap(false).footprint.workflowModulesDisabled }, 1)
+t("the JSON footprint carries the unknown count",
+    { measuredApp.asMap(false).footprint.workflowModulesUnknown }, 0)
+t("the JSON footprint names the module and the reason",
+    { measuredApp.asMap(false).footprint.workflowModuleDiagnostics.collect {
+        it.module + " " + it.code + " " + it.kind } },
+    ["com.acme.app:condition-d DISABLED_MODULE_CLASS_UNAVAILABLE OBSERVATION"])
+
+/* -- recognition is by descriptor, and nothing is read twice ------------------- */
+
+FakeWebResourceModule webResource = new FakeWebResourceModule()
+t("a descriptor without the getter is not a workflow module",
+    { Fp.readWorkflowModule(webResource, "p", "web", "p:web", Boolean.TRUE) }, null)
+FakeLookalikeModule lookalike = new FakeLookalikeModule()
+t("a getter that cannot answer with a class is not the workflow getter",
+    { Fp.readWorkflowModule(lookalike, "p", "x", "p:x", Boolean.TRUE) }, null)
+t("and it is not called to find out", { lookalike.reads }, 0)
+FakeWorkflowModule onceOnly = new FakeWorkflowModule(impl: Op1602ConditionA)
+t("the class is read", {
+    Fp.readWorkflowModule(onceOnly, "p", "m", "p:m", Boolean.TRUE).className
+}, Op1602ConditionA.getName())
+t("exactly once", { onceOnly.reads }, 1)
+FakeEnablementSource enablementOnce = new FakeEnablementSource(answer: Boolean.FALSE)
+List<String> enablementSink = []
+t("enablement is read as it is", {
+    Fp.readModuleEnablement(enablementOnce, "p:m", enablementSink)
+}, Boolean.FALSE)
+t("exactly once as well", { enablementOnce.reads }, 1)
+t("and a clean read leaves no diagnostic", { enablementSink.size() }, 0)
+
+/* The old path, kept as the control. safeCall answers null for both of these. */
+def controlOldPath = { Object descriptor -> Fp.safeCall(descriptor, "getImplementationClass") }
+FakeWorkflowModule nullGetter = new FakeWorkflowModule()
+FakeWorkflowModule throwingGetter = new FakeWorkflowModule(failure: new IllegalStateException("boom"))
+ok("red before green: the control cannot tell a null getter from a throwing one",
+    controlOldPath(nullGetter) == null && controlOldPath(throwingGetter) == null)
+t("the module read can", {
+    Fp.readWorkflowModule(nullGetter, "p", "m", "p:m", Boolean.FALSE).codes() !=
+        Fp.readWorkflowModule(throwingGetter, "p", "m", "p:m", Boolean.FALSE).codes()
+}, true)
+ok("the endpoint no longer reads the class through safeCall",
+    !endpointText.contains('Fp.safeCall(descriptor, "getImplementationClass")'))
+ok("the endpoint reads the workflow module through the classifier",
+    endpointText.contains('Fp.readWorkflowModule(descriptor, app.pluginKey, module.key,'))
+ok("the endpoint reads the enablement through the shared helper",
+    endpointText.contains('Fp.readModuleEnablement(pluginAccessor, module.completeKey, app.diagnostics)'))
+/* getModuleClass feeds the class index and the text scan, so its failure limits both */
+ok("a failed getModuleClass read reaches the diagnostics",
+    (endpointText =~ /Class<\?> moduleClazz = descriptor\.getModuleClass\(\)[\s\S]{0,600}catch \(Throwable error\) \{\s*module\.moduleClass = null\s*Fp\.note\(app\.diagnostics, "module class "/).find())
+
+/* -- enabled + null, getter throws, enablement unreadable ---------------------- */
+
+List enabledNullReads = []
+AppFootprint enabledNullApp = newApp("com.acme.enabled-null")
+Object enabledNull = register(enabledNullApp, enabledNullReads, "condition", Boolean.TRUE)
+scan([enabledNullApp], enabledNullReads, [])
+t("enabled without a class has its own code",
+    { enabledNull.codes() }, ["ENABLED_MODULE_CLASS_UNAVAILABLE"])
+t("it stays a registered module, never a zero",
+    { enabledNullApp.workflowModuleKeys }, ["condition"])
+t("and it counts as enabled", { enabledNullApp.workflowModulesEnabled }, 1)
+t("it is reported", {
+    enabledNullApp.diagnostics.size() == 1 &&
+        enabledNullApp.diagnostics[0].contains("ENABLED_MODULE_CLASS_UNAVAILABLE") &&
+        enabledNullApp.diagnostics[0].contains("com.acme.enabled-null:condition")
+}, true)
+t("and it reaches the JSON as an incomplete read",
+    { enabledNullApp.asMap(false).footprint.workflowModuleDiagnostics*.kind }, ["INCOMPLETE"])
+
+List disabledThrowReads = []
+AppFootprint disabledThrowApp = newApp("com.acme.disabled-throw")
+Object disabledThrow = register(disabledThrowApp, disabledThrowReads, "condition", Boolean.FALSE,
+    null, new IllegalStateException("broken lookup"))
+scan([disabledThrowApp], disabledThrowReads, [])
+t("a throwing getter is a read failure even on a disabled module",
+    { disabledThrow.codes() }, ["MODULE_IMPLEMENTATION_READ_FAILED"])
+t("and it raises a read error", { disabledThrowApp.diagnosticCount }, 1)
+t("naming the module and the cause", {
+    disabledThrowApp.diagnostics[0].contains("com.acme.disabled-throw:condition") &&
+        disabledThrowApp.diagnostics[0].contains("broken lookup")
+}, true)
+t("the module stays registered", { disabledThrowApp.workflowModulesDisabled }, 1)
+t("and the JSON kind is a read error",
+    { disabledThrowApp.asMap(false).footprint.workflowModuleDiagnostics*.kind }, ["READ_ERROR"])
+
+FakeEnablementSource brokenEnablement = new FakeEnablementSource(
+    answer: new IllegalArgumentException("no such module"))
+List<String> brokenEnablementSink = []
+t("an enablement read that throws answers null, not false",
+    { Fp.readModuleEnablement(brokenEnablement, "p:m", brokenEnablementSink) }, null)
+t("and it is noted against the module", {
+    brokenEnablementSink.size() == 1 && brokenEnablementSink[0].contains("p:m")
+}, true)
+
+List unknownStateReads = []
+AppFootprint unknownStateApp = newApp("com.acme.unknown-state")
+Object unknownNull = register(unknownStateApp, unknownStateReads, "condition", null)
+Object unknownWithClass = register(unknownStateApp, unknownStateReads, "validator", null, Op1602ConditionA)
+scan([unknownStateApp], unknownStateReads, [])
+t("unknown state and no class carries both reasons", { unknownNull.codes() },
+    ["MODULE_ENABLEMENT_UNAVAILABLE", "MODULE_CLASS_UNAVAILABLE_ENABLEMENT_UNKNOWN"])
+t("unknown state with a read class keeps the class",
+    { unknownWithClass.className }, Op1602ConditionA.getName())
+t("and carries the enablement reason alone",
+    { unknownWithClass.codes() }, ["MODULE_ENABLEMENT_UNAVAILABLE"])
+t("both count as unknown", { unknownStateApp.workflowModulesUnknown }, 2)
+t("and neither as enabled or disabled",
+    { unknownStateApp.workflowModulesEnabled + unknownStateApp.workflowModulesDisabled }, 0)
+
+/* -- capability ---------------------------------------------------------------- */
+
+List dormantReads = []
+AppFootprint dormantApp = newApp("com.acme.dormant")
+register(dormantApp, dormantReads, "condition", Boolean.TRUE, Op1602ConditionA)
+scan([dormantApp], dormantReads, [])
+t("a proven enabled module and no usage is dormant",
+    { dormantApp.workflowCapability }, "Dormant")
+
+List dormantUnknownReads = []
+AppFootprint dormantUnknownApp = newApp("com.acme.dormant-unknown")
+register(dormantUnknownApp, dormantUnknownReads, "condition", Boolean.TRUE, Op1602ConditionA)
+register(dormantUnknownApp, dormantUnknownReads, "validator", null, Op1602ConditionB)
+scan([dormantUnknownApp], dormantUnknownReads, [])
+t("a second module of unknown state does not undo the proof of a first",
+    { dormantUnknownApp.workflowCapability }, "Dormant")
+
+List disabledOnlyReads = []
+AppFootprint disabledOnlyApp = newApp("com.acme.disabled-only")
+register(disabledOnlyApp, disabledOnlyReads, "condition", Boolean.FALSE)
+register(disabledOnlyApp, disabledOnlyReads, "validator", Boolean.FALSE)
+scan([disabledOnlyApp], disabledOnlyReads, [])
+t("all modules proven disabled has a state of its own, never None",
+    { disabledOnlyApp.workflowCapability }, "Disabled modules only")
+t("and that state keeps its modules", { disabledOnlyApp.workflowModuleKeys.size() }, 2)
+ok("the five capability states stay distinguishable", ["None", "Dormant", "In use",
+    "Disabled modules only", "Unknown"].unique().size() == 5)
+t("the constant carries that name", { Fp.CAPABILITY_DISABLED_ONLY }, "Disabled modules only")
+t("and so does the other new one", { Fp.CAPABILITY_UNKNOWN }, "Unknown")
+
+List disabledUnknownReads = []
+AppFootprint disabledUnknownApp = newApp("com.acme.disabled-unknown")
+register(disabledUnknownApp, disabledUnknownReads, "condition", Boolean.FALSE)
+register(disabledUnknownApp, disabledUnknownReads, "validator", null)
+scan([disabledUnknownApp], disabledUnknownReads, [])
+t("an unreadable state that could prove an enabled module means Unknown",
+    { disabledUnknownApp.workflowCapability }, "Unknown")
+
+List listFailureReads = []
+AppFootprint listFailureApp = newApp("com.acme.list-failure")
+scan([listFailureApp], listFailureReads, [], [:], new HashSet(["com.acme.list-failure"]))
+t("an unreadable module list is Unknown, never None",
+    { listFailureApp.workflowCapability }, "Unknown")
+
+List walkFailureReads = []
+AppFootprint walkFailureApp = newApp("com.acme.walk-failure")
+register(walkFailureApp, walkFailureReads, "condition", Boolean.TRUE, Op1602ConditionA)
+scan([walkFailureApp], walkFailureReads, [], [:], new HashSet(), false)
+t("a workflow that could not be walked leaves dormant unproven",
+    { walkFailureApp.workflowCapability }, "Unknown")
+List walkFailureNoneReads = []
+AppFootprint walkFailureNoneApp = newApp("com.acme.walk-failure-none")
+scan([walkFailureNoneApp], walkFailureNoneReads, [], [:], new HashSet(), false)
+t("but an app with a read, empty module list still has no capability",
+    { walkFailureNoneApp.workflowCapability }, "None")
+
+List positiveReads = []
+AppFootprint positiveApp = newApp("com.acme.positive")
+register(positiveApp, positiveReads, "post-function", Boolean.FALSE)
+WorkflowExtension positiveKey = new WorkflowExtension(kind: Fp.KIND_POST_FUNCTION,
+    fullModuleKey: "com.acme.positivepost-function", className: "com.acme.positive.Gone")
+scan([positiveApp], positiveReads, [positiveKey])
+t("a positive reference wins over the disabled flag",
+    { positiveApp.workflowCapability }, "In use")
+t("and it is attributed by its key", { positiveKey.ownerPluginKey }, "com.acme.positive")
+
+List positiveUnknownReads = []
+AppFootprint positiveUnknownApp = newApp("com.acme.positive-unknown")
+register(positiveUnknownApp, positiveUnknownReads, "post-function", null)
+WorkflowExtension positiveUnknownKey = new WorkflowExtension(kind: Fp.KIND_POST_FUNCTION,
+    fullModuleKey: "com.acme.positive-unknownpost-function")
+scan([positiveUnknownApp], positiveUnknownReads, [positiveUnknownKey])
+t("a positive reference wins over an unknown state as well",
+    { positiveUnknownApp.workflowCapability }, "In use")
+
+/* -- attribution: who may contest a read class ------------------------------- */
+
+List rivalDisabledReads = []
+AppFootprint classOwner = newApp("com.acme.owner")
+AppFootprint disabledRival = newApp("com.acme.disabled-rival")
+register(classOwner, rivalDisabledReads, "condition", Boolean.TRUE, Op1602ConditionA)
+register(disabledRival, rivalDisabledReads, "condition", Boolean.FALSE)
+WorkflowExtension keptPosition = classOnly(Op1602ConditionA)
+scan([classOwner, disabledRival], rivalDisabledReads, [keptPosition])
+t("a disabled-only app is no competitor of a unique class owner",
+    { keptPosition.ownerPluginKey }, "com.acme.owner")
+t("the position stays a class match", { keptPosition.attribution }, Fp.BY_MODULE_CLASS)
+t("the owner counts it", { classOwner.extensionPointCount }, 1)
+t("the disabled app does not", { disabledRival.extensionPointCount }, 0)
+t("the disabled app stays disabled-only",
+    { disabledRival.workflowCapability }, "Disabled modules only")
+t("nothing is open", { Fp.groupOpenPositions([keptPosition]).size() }, 0)
+
+List rivalEnabledReads = []
+AppFootprint contestedOwner = newApp("com.acme.owner")
+AppFootprint enabledRival = newApp("com.acme.enabled-rival")
+register(contestedOwner, rivalEnabledReads, "condition", Boolean.TRUE, Op1602ConditionA)
+register(enabledRival, rivalEnabledReads, "condition", Boolean.TRUE)
+WorkflowExtension contested = classOnly(Op1602ConditionA)
+scan([contestedOwner, enabledRival], rivalEnabledReads, [contested])
+t("enabled without a class stays a competitor: the position opens",
+    { contested.ownerPluginKey }, null)
+t("with the catalog reason", { contested.openReason }, "WORKFLOW_CLASS_CATALOG_INCOMPLETE")
+t("and both possible owners named", { contested.openCandidates },
+    ["com.acme.enabled-rival", "com.acme.owner"])
+t("dropped from the former owner's numbers", { contestedOwner.extensionPointCount }, 0)
+t("and from the rival's", { enabledRival.extensionPointCount }, 0)
+t("which leaves the former owner's verdict open, not dormant",
+    { contestedOwner.workflowCapability }, "Unknown")
+t("and the rival's", { enabledRival.workflowCapability }, "Unknown")
+t("the app knows it is a candidate", { contestedOwner.openWorkflowPositions }, 1)
+
+/* The old rule as the control: first class owner wins, whatever else was unread. */
+ok("red before green: the control keeps the owner where a competitor is unread",
+    { Map<String, String> first = [(Op1602ConditionA.getName()): "com.acme.owner"]
+      WorkflowExtension control = classOnly(Op1602ConditionA)
+      Fp.resolveOwner(control, ["com.acme.owner", "com.acme.enabled-rival"], first, [:])
+      control.ownerPluginKey == "com.acme.owner" }.call())
+
+List rivalThrowReads = []
+AppFootprint throwOwner = newApp("com.acme.owner")
+AppFootprint throwRival = newApp("com.acme.throw-rival")
+register(throwOwner, rivalThrowReads, "condition", Boolean.TRUE, Op1602ConditionA)
+register(throwRival, rivalThrowReads, "condition", Boolean.FALSE, null, new IllegalStateException("x"))
+WorkflowExtension contestedByFailure = classOnly(Op1602ConditionA)
+scan([throwOwner, throwRival], rivalThrowReads, [contestedByFailure])
+t("a failed read competes even on a disabled module",
+    { contestedByFailure.openCandidates }, ["com.acme.owner", "com.acme.throw-rival"])
+
+List rivalUnknownReads = []
+AppFootprint unknownOwner = newApp("com.acme.owner")
+AppFootprint unknownRival = newApp("com.acme.unknown-rival")
+register(unknownOwner, rivalUnknownReads, "condition", Boolean.TRUE, Op1602ConditionA)
+register(unknownRival, rivalUnknownReads, "condition", null)
+WorkflowExtension contestedByUnknown = classOnly(Op1602ConditionA)
+scan([unknownOwner, unknownRival], rivalUnknownReads, [contestedByUnknown])
+t("an unknown state without a class competes too", { contestedByUnknown.ownerPluginKey }, null)
+
+List rivalListReads = []
+AppFootprint listOwner = newApp("com.acme.owner")
+AppFootprint listRival = newApp("com.acme.list-rival")
+register(listOwner, rivalListReads, "condition", Boolean.TRUE, Op1602ConditionA)
+WorkflowExtension contestedByList = classOnly(Op1602ConditionA)
+scan([listOwner, listRival], rivalListReads, [contestedByList], [:], new HashSet(["com.acme.list-rival"]))
+t("an unread module list competes too",
+    { contestedByList.openCandidates }, ["com.acme.list-rival", "com.acme.owner"])
+
+List selfReads = []
+AppFootprint selfOwner = newApp("com.acme.self")
+register(selfOwner, selfReads, "condition", Boolean.TRUE, Op1602ConditionA)
+register(selfOwner, selfReads, "validator", Boolean.TRUE)
+WorkflowExtension selfPosition = classOnly(Op1602ConditionA)
+scan([selfOwner], selfReads, [selfPosition])
+t("an app does not contest its own class", { selfPosition.ownerPluginKey }, "com.acme.self")
+
+List twoReaderReads = []
+AppFootprint readerOne = newApp("com.acme.one")
+AppFootprint readerTwo = newApp("com.acme.two")
+register(readerOne, twoReaderReads, "condition", Boolean.TRUE, Op1602ConditionA)
+register(readerTwo, twoReaderReads, "condition", Boolean.TRUE, Op1602ConditionA)
+WorkflowExtension twoReaders = classOnly(Op1602ConditionA)
+scan([readerOne, readerTwo], twoReaderReads, [twoReaders])
+t("a class read by two apps has no owner", { twoReaders.ownerPluginKey }, null)
+t("the reason says it is ambiguous", { twoReaders.openReason }, "OWNERSHIP_AMBIGUOUS")
+t("and it names both", { twoReaders.openCandidates }, ["com.acme.one", "com.acme.two"])
+
+/* -- what must not move: key, prefix and factory attribution ------------------- */
+
+List keyAttributionReads = []
+AppFootprint keyedApp = newApp("com.acme.keyed")
+AppFootprint keyRival = newApp("com.acme.key-rival")
+register(keyedApp, keyAttributionReads, "post-function", Boolean.FALSE)
+register(keyRival, keyAttributionReads, "condition", Boolean.TRUE)
+WorkflowExtension exactKey = new WorkflowExtension(kind: Fp.KIND_POST_FUNCTION,
+    fullModuleKey: "com.acme.keyedpost-function", className: "com.acme.keyed.Gone")
+WorkflowExtension prefixOnly = new WorkflowExtension(kind: Fp.KIND_POST_FUNCTION,
+    fullModuleKey: "com.acme.keyedremoved-function")
+scan([keyedApp, keyRival], keyAttributionReads, [exactKey, prefixOnly])
+t("a key attribution ignores a competitor", { exactKey.ownerPluginKey }, "com.acme.keyed")
+t("and stays a key match", { exactKey.attribution }, Fp.BY_MODULE_KEY)
+t("the longest prefix keeps its owner as well", { prefixOnly.ownerPluginKey }, "com.acme.keyed")
+t("neither is open", { exactKey.openReason == null && prefixOnly.openReason == null }, true)
+
+List factoryReads = []
+AppFootprint factoryApp = newApp("com.acme.factory")
+WorkflowExtension factoryPosition = new WorkflowExtension(kind: Fp.KIND_CONDITION,
+    className: "com.atlassian.jira.plugin.workflow.WorkflowPluginConditionFactory")
+scan([factoryApp], factoryReads, [factoryPosition],
+    ["com.atlassian.jira.plugin.workflow.WorkflowPluginConditionFactory": "com.acme.factory"])
+t("the factory fallback still attributes", { factoryPosition.ownerPluginKey }, "com.acme.factory")
+
+List namedReads = []
+AppFootprint namedApp = newApp("com.acme.named")
+register(namedApp, namedReads, "prefix-com.acme.canned.DisabledThing", Boolean.FALSE)
+register(namedApp, namedReads, "condition", Boolean.TRUE, Op1602ConditionB)
+WorkflowExtension namedByArgument = classOnly(Op1602ConditionB)
+namedByArgument.identity.add("com.acme.canned.DisabledThing")
+scan([namedApp], namedReads, [namedByArgument])
+t("a disabled module can still be named behind an entry", { namedByArgument.moduleKey },
+    "prefix-com.acme.canned.DisabledThing")
+
+/* -- a position with no owner no longer vanishes -------------------------------- */
+
+List gapReads = []
+AppFootprint gapApp = newApp("com.acme.gap")
+AppFootprint gapClassApp = newApp("com.acme.class")
+register(gapApp, gapReads, "condition", Boolean.FALSE)
+register(gapClassApp, gapReads, "condition", Boolean.TRUE, Op1602ConditionA)
+WorkflowExtension orphanOne = new WorkflowExtension(kind: Fp.KIND_CONDITION, workflowName: "WF 1",
+    scope: "Transition", transitionId: 11, transitionName: "Start", chain: "conditions",
+    position: 1, chainLength: 1, className: "com.acme.gone.Condition")
+WorkflowExtension orphanTwo = new WorkflowExtension(kind: Fp.KIND_VALIDATOR, workflowName: "WF 2",
+    scope: "Transition", transitionId: 21, transitionName: "Done", chain: "validators",
+    position: 2, chainLength: 2, className: "com.acme.gone.Condition")
+List<WorkflowExtension> orphans = [orphanOne, orphanTwo]
+scan([gapApp, gapClassApp], gapReads, orphans)
+t("an unknown class stays without an owner", { orphanOne.ownerPluginKey }, null)
+t("it is open because a class could not be read",
+    { orphanOne.openReason }, "WORKFLOW_CLASS_CATALOG_INCOMPLETE")
+t("a disabled module could own it, and is named as such",
+    { orphanOne.openDisabledCandidates }, ["com.acme.gap"])
+t("without making it a contender", { orphanOne.openCandidates }, [])
+t("so a disabled-only app keeps its verdict",
+    { gapApp.workflowCapability }, "Disabled modules only")
+t("and the app reading another class stays out of it",
+    { gapClassApp.workflowCapability }, "Dormant")
+t("it stays out of every app's numbers",
+    { gapApp.extensionPointCount + gapClassApp.extensionPointCount }, 0)
+t("two positions of one class form one group",
+    { Fp.groupOpenPositions(orphans).size() }, 1)
+t("the group counts them", { Fp.groupOpenPositions(orphans)[0].positions }, 2)
+t("the total is available as a single number", { Fp.openPositionTotal(Fp.groupOpenPositions(orphans)) }, 2)
+t("the group names the class", { Fp.groupOpenPositions(orphans)[0].evidence }, "com.acme.gone.Condition")
+t("the group names the kinds", { Fp.groupOpenPositions(orphans)[0].kinds },
+    [Fp.KIND_CONDITION, Fp.KIND_VALIDATOR])
+t("the group counts the workflows", { Fp.groupOpenPositions(orphans)[0].workflows }, 2)
+t("the group shows where", { Fp.groupOpenPositions(orphans)[0].examples[0].contains("WF 1") }, true)
+t("an entry listing is not cut when it fits",
+    { Fp.groupOpenPositions(orphans)[0].examplesTruncated }, false)
+
+List<WorkflowExtension> manyOrphans = (1..40).collect { int index ->
+    new WorkflowExtension(kind: Fp.KIND_POST_FUNCTION, workflowName: "WF " + index,
+        className: "com.acme.gone.Function", openReason: "OWNER_NOT_PROVEN") }
+t("a long list keeps its exact count",
+    { Fp.groupOpenPositions(manyOrphans)[0].positions }, 40)
+t("cuts its examples", { Fp.groupOpenPositions(manyOrphans)[0].examples.size() < 40 }, true)
+t("and says that it did", { Fp.groupOpenPositions(manyOrphans)[0].examplesTruncated }, true)
+
+List noGapReads = []
+AppFootprint noGapApp = newApp("com.acme.nogap")
+register(noGapApp, noGapReads, "condition", Boolean.TRUE, Op1602ConditionA)
+WorkflowExtension nativePosition = new WorkflowExtension(kind: Fp.KIND_POST_FUNCTION,
+    className: "com.atlassian.jira.workflow.function.issue.UpdateIssueStatusFunction")
+WorkflowExtension blankPosition = new WorkflowExtension(kind: Fp.KIND_POST_FUNCTION, type: "class")
+scan([noGapApp], noGapReads, [nativePosition, blankPosition])
+t("a class no app read and no gap could explain says so",
+    { nativePosition.openReason }, "OWNER_NOT_PROVEN")
+t("with no candidates", { nativePosition.openCandidates + nativePosition.openDisabledCandidates }, [])
+t("an entry with no class at all is listed too", { blankPosition.openReason }, "OWNER_NOT_PROVEN")
+t("under what it does show",
+    { Fp.groupOpenPositions([blankPosition])[0].evidence }, "type: class")
+
+/* -- the visible output ---------------------------------------------------------- */
+
+t("the section names the app, the module and the reason", {
+    String section = Fp.workflowAttributionHtml([measuredApp], [], true, Locale.ENGLISH)
+    section.contains("com.acme.app") && section.contains("com.acme.app:condition-d") &&
+        section.contains("Disabled") && section.contains("DISABLED_MODULE_CLASS_UNAVAILABLE")
+}, true)
+t("the section lists the open positions and their count", {
+    String section = Fp.workflowAttributionHtml([], Fp.groupOpenPositions(orphans), true, Locale.ENGLISH)
+    section.contains("com.acme.gone.Condition") && section.contains("WORKFLOW_CLASS_CATALOG_INCOMPLETE") &&
+        section.contains("com.acme.gap") && section.contains(">2<")
+}, true)
+t("nothing to say renders nothing",
+    { Fp.workflowAttributionHtml([dormantApp], [], true, Locale.ENGLISH) }, "")
+t("the section escapes what it prints", {
+    AppFootprint hostile = newApp("<b>key")
+    hostile.displayName = "<b>name"
+    Fp.workflowAttributionHtml([hostile], [[evidence: "<i>class", reason: "OWNER_NOT_PROVEN",
+        positions: 1, kinds: ["<k>"], workflows: 1, candidates: ["<c>"],
+        disabledCandidates: [], examples: ["<e>"], examplesTruncated: false]], true,
+        Locale.ENGLISH).contains("&lt;i&gt;class")
+}, true)
+t("the section does not claim an exact count over an incomplete walk", {
+    Fp.workflowAttributionHtml([], Fp.groupOpenPositions(orphans), false, Locale.ENGLISH)
+        .contains("lower bound")
+}, true)
+t("the card explains a disabled-only app without calling it dormant", {
+    String note = Fp.capabilityNote(disabledOnlyApp, Locale.ENGLISH)
+    note.contains("disabled") && !note.toLowerCase(Locale.ROOT).contains("dormant capability")
+}, true)
+t("the card keeps the dormant sentence", {
+    Fp.capabilityNote(dormantApp, Locale.ENGLISH).startsWith("Dormant capability.")
+}, true)
+t("the card does not call an unknown verdict a number", {
+    Fp.extensionPointCell(disabledUnknownApp, Locale.ENGLISH).contains("unknown")
+}, true)
+t("the metric of a disabled-only app says so", {
+    Fp.extensionPointCell(disabledOnlyApp, Locale.ENGLISH).contains("disabled")
+}, true)
+t("the metric of an app in use stays the count", {
+    Fp.extensionPointCell(classOwner, Locale.ENGLISH)
+}, "1")
+t("the metric marks a count a candidate position could raise", {
+    AppFootprint usedAndOpen = newApp("com.acme.used")
+    usedAndOpen.extensionPointCount = 2
+    usedAndOpen.openWorkflowPositions = 1
+    usedAndOpen.workflowCapability = "In use"
+    Fp.extensionPointCell(usedAndOpen, Locale.ENGLISH).contains("&#42;")
+}, true)
+
+/* New CSV columns go at the end, so every existing column keeps position and unit. */
+String legacyCsvTail = 'csv.append("detectedFootprint,diagnostics'
+ok("the existing CSV header is still intact up to its last old column",
+    endpointText.contains('csv.append("workflowCapability,workflowModules,")') &&
+    endpointText.contains(legacyCsvTail))
+ok("the existing CSV header is extended at its end",
+    endpointText.contains(legacyCsvTail + ',${Fp.WORKFLOW_CSV_COLUMNS}\\n")'))
+ok("the existing CSV row is extended at its end",
+    (endpointText =~ /csv\.append\(app\.diagnosticCount\)\.append\(","\)\s*csv\.append\(Fp\.workflowCsvCells\(app, openPositionGroups\)\)\.append\("\\n"\)/).find())
+t("the CSV header names the new columns", { Fp.WORKFLOW_CSV_COLUMNS },
+    "workflowModulesEnabled,workflowModulesDisabled,workflowModulesUnknown,workflowModuleDiagnostics," +
+    "openWorkflowPositions,unattributedExtensionPoints,unattributedExtensionPointReasons")
+t("the CSV cells carry the counts and the diagnostics", {
+    Fp.workflowCsvCells(measuredApp, Fp.groupOpenPositions(orphans))
+}, '3,1,0,"com.acme.app:condition-d DISABLED_MODULE_CLASS_UNAVAILABLE",0,2,"WORKFLOW_CLASS_CATALOG_INCOMPLETE=2"')
+t("the CSV cells match the header in number", {
+    Fp.WORKFLOW_CSV_COLUMNS.split(",").size()
+}, 7)
+
+ok("the JSON summary carries the open position count",
+    endpointText.contains('unattributedExtensionPoints: unattributedExtensionPoints,'))
+ok("the JSON report lists the open positions",
+    endpointText.contains('workflowAttribution: Fp.workflowAttributionMap(apps, openPositionGroups, workflowExtensionWalkComplete)'))
+t("the JSON attribution block carries both lists", {
+    Map block = Fp.workflowAttributionMap([measuredApp], Fp.groupOpenPositions(orphans), true)
+    block.unattributedExtensionPoints == 2 && block.complete == true &&
+        block.positions.size() == 1 && block.moduleDiagnostics.size() == 1 &&
+        block.moduleDiagnostics[0].app == "com.acme.app"
+}, true)
+ok("the report renders the attribution section",
+    endpointText.contains('Fp.workflowAttributionHtml(apps, openPositionGroups, workflowExtensionWalkComplete, numberLocale)'))
+ok("the instance summary counts the unknown verdicts apart",
+    endpointText.contains('workflowCapabilityUnknownApps: totalUnknownWorkflowApps') &&
+    endpointText.contains('workflowCapabilityDisabledOnlyApps: totalDisabledOnlyWorkflowApps'))
+
+ok("no fixture step failed: " + op1602SetupFailures, op1602SetupFailures.isEmpty())
+
 /* ---- result --------------------------------------------------------------- */
 
 println "PASSED: " + passed
